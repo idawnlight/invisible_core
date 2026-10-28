@@ -276,10 +276,9 @@ _MONOSPACE_LANG_GROUPS = (
 #  Baseline - applied to every session regardless of Profile.
 # ──────────────────────────────────────────────────────────────────────
 
-#: Where every session's engine reports a launch. One place; the engine's
-#: compiled default says the same, for a bare launch with no profile prefs.
-USAGE_PING_URL = ("https://github.com/feder-cr/firefox_antidetect_patch"
-                  "/releases/download/usage-counter/launch.txt")
+#: The fork has no default counter endpoint, matching the native default.
+#: A session may provide its own URL through extra_prefs.
+USAGE_PING_URL = ""
 
 _BASELINE: Dict[str, Any] = {
     # Turn off Firefox's own resistFingerprinting; we do our own via patches.
@@ -582,7 +581,6 @@ _BASELINE: Dict[str, Any] = {
     # pinned engine (tests/test_pref_types.py): it moved nothing.
     "browser.contentblocking.report.lockwise.enabled":    False,
     "browser.contentblocking.report.monitor.enabled":     False,
-    "dom.private-attribution.submission.enabled":         False,
 
     "browser.translations.enable":                        False,
 

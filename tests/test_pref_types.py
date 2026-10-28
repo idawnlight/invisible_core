@@ -165,7 +165,7 @@ def reader_kinds(source: EngineSource, names) -> Dict[str, Tuple[Set[str], str]]
 
 
 def _through_a_constant(source: EngineSource, names: Set[str]) -> Dict[str, Set[str]]:
-    """`const kPref = "name"` (or `static const char k[] = "name"`) and then
+    """`const kPref = "name"`, `static const char k[] = "name"` or a macro, then
     `getBoolPref(kPref)` in the same file. One search for every name: a
     search of the engine costs seconds, and a name each was most of the
     gate's time."""
@@ -176,13 +176,38 @@ def _through_a_constant(source: EngineSource, names: Set[str]) -> Dict[str, Set[
     out: Dict[str, Set[str]] = {}
     texts: Dict[str, str] = {}
     for path, line in hits:
-        for m in re.finditer(r"""(\w+)\s*(?:\[\])?\s*=\s*["']([^"']+)["']""", line):
-            if m.group(2) not in names:
+        for m in re.finditer(
+                r"""(?:(\w+)\s*(?:\[\])?\s*=\s*|#\s*define\s+(\w+)\s+)["']([^"']+)["']""",
+                line):
+            constant, name = m.group(1) or m.group(2), m.group(3)
+            if name not in names:
                 continue
             body = texts.setdefault(path, source.show(path) or "")
-            for a in re.finditer(_ACCESSOR + r"\(\s*" + re.escape(m.group(1)) + r"\b", body):
-                out.setdefault(m.group(2), set()).add(_ACCESSOR_KIND[a.group(1)])
+            for a in re.finditer(_ACCESSOR + r"\(\s*" + re.escape(constant) + r"\b", body):
+                out.setdefault(name, set()).add(_ACCESSOR_KIND[a.group(1)])
     return out
+
+
+@pytest.mark.parametrize("declaration", [
+    'static const char LOCALE[] = "intl.locale.requested";',
+    'const char* LOCALE = "intl.locale.requested";',
+    '#define LOCALE "intl.locale.requested"',
+])
+def test_constant_readers_require_an_accessor_in_the_same_file(declaration):
+    class Source:
+        body = declaration
+
+        def lines_with(self, names, extensions):
+            return [("fixture.cpp", declaration)]
+
+        def show(self, path):
+            return self.body
+
+    source = Source()
+    names = {"intl.locale.requested"}
+    assert _through_a_constant(source, names) == {}
+    source.body += "\nPreferences::GetCString(LOCALE, locale);\n"
+    assert _through_a_constant(source, names) == {"intl.locale.requested": {STR}}
 
 
 def python_kinds(value) -> Set[str]:

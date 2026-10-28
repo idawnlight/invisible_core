@@ -27,6 +27,8 @@ from __future__ import annotations
 
 #: Where sealed engine trees live (`download.engine_root`).
 ENGINE_DIR = "INVISIBLE_PLAYWRIGHT_ENGINE_DIR"
+#: GitHub owner/repository hosting the fork's engine releases.
+ENGINE_REPOSITORY = "INVISIBLE_FIREFOX_RELEASE_REPOSITORY"
 #: The machine's writable state, and the engine store by default (`download.cache_root`).
 CACHE_DIR = "INVISIBLE_PLAYWRIGHT_CACHE_DIR"
 #: How long a download may take (`download.download_deadline`).
@@ -64,7 +66,7 @@ DESKTOP = "INVPW_DESKTOP"
 #: Tells the engine to emit no IPv6 candidate, behind a proxy (`launch`).
 WEBRTC_DISABLE_IPV6 = "STEALTHFOX_WEBRTC_DISABLE_IPV6"
 
-SETTINGS = (ENGINE_DIR, CACHE_DIR, DOWNLOAD_DEADLINE, GITHUB_TOKEN_OWN,
+SETTINGS = (ENGINE_DIR, ENGINE_REPOSITORY, CACHE_DIR, DOWNLOAD_DEADLINE, GITHUB_TOKEN_OWN,
             GITHUB_TOKEN, SEAL_FILE, CORE_PIN, CORE_AUTOFIX,
             CORE_AUTOFIX_TIMEOUT, UV, GEOIP_MMDB, FONT_MANIFEST,
             WEBRTC_PUBLIC_IP, CURSOR_TIMER)

@@ -38,6 +38,8 @@ from pathlib import Path
 
 import pytest
 
+from _sibling_repositories import repository_root, workspace_root
+
 pytestmark = pytest.mark.unit
 
 #: TWO since 2026-08-18, not three. `invisible_firefox` was deleted that day -
@@ -65,49 +67,14 @@ _REPOS = ["invisible_core", "invisible_playwright", "invisible_selenium",
           "invisible_puppeteer"]
 
 
-def _release_dir() -> Path:
-    """The folder holding the sibling repos, found even from a git worktree.
-
-    ⛔ THIS WAS `Path(__file__).resolve().parents[2]`, AND IT TURNED 18 OF THE 19
-    CHECKS IN THIS FILE OFF WHEREVER THE WORK ACTUALLY HAPPENS. The project's own
-    rule 17 says every change is made on a branch in a worktree of one's own, and
-    a worktree does not live under `release/`: so from a worktree these checks all
-    reported "not the workbench - the sibling repos are not here" and the file
-    passed having compared nothing. Measured 2026-09-15 in a worktree of this
-    repo: 1 passed, 18 skipped.
-
-    That is the same shape as the index gate, which this project already fixed
-    the same way: the answer is not a declared skip, it is asking GIT where the
-    main checkout is. `--git-common-dir` points at the shared repository's `.git`
-    even from a worktree, so its grandparent is `release/`.
-
-    This repo's OWN tests still come from `__file__`, never from here - see
-    `_citation_files()`. Resolving the siblings must not quietly swap the tree under
-    test for the shared checkout, which sits on whatever commit somebody else left
-    it on: that is the wrong-judge failure this project keeps paying for, and it
-    would be worse than skipping, because it would be green about the wrong tree.
-    """
-    here = Path(__file__).resolve()
-    try:
-        out = subprocess.run(["git", "rev-parse", "--git-common-dir"],
-                             cwd=here.parent, capture_output=True, text=True)
-        if out.returncode == 0 and out.stdout.strip():
-            common = Path(out.stdout.strip())
-            if not common.is_absolute():
-                common = (here.parent / common).resolve()
-            # <release>/<repo>/.git -> <release>
-            candidate = common.parent.parent
-            if (candidate / "invisible_core").is_dir():
-                return candidate
-    except OSError:
-        pass
-    return here.parents[2]
+_RELEASE = workspace_root(__file__)
 
 
-_RELEASE = _release_dir()
+def _repo(name: str) -> Path:
+    return repository_root(name, __file__)
 
-#: This repo as the checkout the tests are RUNNING from, which in a worktree is
-#: not `_RELEASE / "invisible_core"`. Everything that judges THIS tree uses it.
+
+#: The current checkout, including changes in this worktree.
 _SELF = Path(__file__).resolve().parents[1]
 
 def _citations():
@@ -151,10 +118,11 @@ def _workbench_script(name):
 
 
 def _citation_files(mod):
-    """(files, source present), with THIS checkout's tests first and the shared
-    copy of this repo left out: from a worktree, `_RELEASE / "invisible_core"`
-    is somebody else's tree on somebody else's commit."""
-    return mod.test_files(_RELEASE, _RELEASE.parent, first=[_SELF / "tests"], skip={_SELF.name})
+    """Collect tests from the same-branch checkouts of every sibling."""
+    return mod.test_files(
+        _RELEASE, _RELEASE.parent,
+        first=[_repo(repo) / "tests" for repo in _REPOS], skip=set(_REPOS),
+    )
 
 
 def _is_vendored(rel: str) -> bool:
@@ -172,7 +140,7 @@ def _is_vendored(rel: str) -> bool:
     return "_pw" in parts or "_driver" in parts
 
 def _pytest_config(repo: str) -> dict:
-    path = _RELEASE / repo / "pyproject.toml"
+    path = _repo(repo) / "pyproject.toml"
     if not path.is_file():
         pytest.skip("not the workbench - the sibling repos are not here")
     with path.open("rb") as fh:
@@ -251,7 +219,7 @@ def test_every_repo_refuses_a_run_in_which_nothing_ran():
     }
     missing = []
     for repo, rel in wanted.items():
-        path = _RELEASE / repo / rel
+        path = _repo(repo) / rel
         if not path.is_file():
             pytest.skip("not the workbench - the sibling repos are not here")
         text = path.read_text(encoding="utf-8")
@@ -302,7 +270,7 @@ def test_a_repo_whose_suite_demands_armed_hooks_arms_them_in_ci():
 
     demanded, armed, missing = [], [], []
     for repo in _REPOS:
-        root = _RELEASE / repo
+        root = _repo(repo)
         if not root.is_dir():
             pytest.skip("not the workbench - the sibling repos are not here")
         tests_dir = root / "tests"
@@ -392,7 +360,7 @@ def test_no_install_e2e_file_imports_a_package_the_runner_does_not_have():
     """
     checked, offenders = [], []
     for repo in _REPOS:
-        root = _RELEASE / repo
+        root = _repo(repo)
         if not root.is_dir():
             pytest.skip("not the workbench - the sibling repos are not here")
         for path in _install_e2e_files(root):
@@ -488,7 +456,7 @@ def test_every_repo_runs_the_undefined_name_check():
 
     missing = []
     for repo, rel in _DEFAULT_SUITE_WORKFLOW.items():
-        path = _RELEASE / repo / rel
+        path = _repo(repo) / rel
         if not path.is_file():
             pytest.skip("not the workbench - the sibling repos are not here")
         text = path.read_text(encoding="utf-8")
@@ -576,7 +544,7 @@ def test_no_test_uses_a_globally_routable_placeholder_ip():
 
     offenders = []
     for repo in _REPOS:
-        tests = _RELEASE / repo / "tests"
+        tests = _repo(repo) / "tests"
         if not tests.is_dir():
             pytest.skip("not the workbench - the sibling repos are not here")
         for path in sorted(tests.rglob("test_*.py")):
@@ -655,7 +623,7 @@ def test_no_tracked_text_file_carries_an_invisible_control_character():
     # committed); this test calls it for that root, and pins that the two sets of
     # forbidden bytes and text suffixes are the SAME set, so the copy kept here for
     # the repositories cannot drift from it.
-    roots = [_RELEASE / repo for repo in _REPOS]
+    roots = [_repo(repo) for repo in _REPOS]
     offenders = []
     if (_RELEASE.parent / "docs").is_dir():
         rules = _doc_rules()
@@ -742,7 +710,7 @@ def test_no_string_LITERAL_evaluates_to_a_control_character():
         # `_release_dir`): judged through `_RELEASE` it was whatever commit the
         # shared clone sat on, and turned red in every worktree the day that
         # clone moved to a release carrying a literal this tree had fixed.
-        root = _SELF if repo == "invisible_core" else _RELEASE / repo
+        root = _SELF if repo == "invisible_core" else _repo(repo)
         if not root.is_dir():
             pytest.skip("not the workbench - the sibling repos are not here")
         listing = subprocess.run(["git", "-C", str(root), "ls-files", "*.py"],
@@ -796,7 +764,7 @@ def test_the_core_checks_daily_that_its_published_seals_still_resolve():
     fails on a missing tag rather than merely printing - the shape that made
     every earlier fail-open in this codebase.
     """
-    path = _RELEASE / "invisible_core" / ".github" / "workflows" / "user-install.yml"
+    path = _repo("invisible_core") / ".github" / "workflows" / "user-install.yml"
     if not path.is_file():
         pytest.skip("not the workbench")
     text = path.read_text(encoding="utf-8")
@@ -857,8 +825,8 @@ def test_every_python_a_repo_promises_is_actually_run():
 
     problems = []
     for repo, rel in _DEFAULT_SUITE_WORKFLOW.items():
-        wf = _RELEASE / repo / rel
-        pyproject = _RELEASE / repo / "pyproject.toml"
+        wf = _repo(repo) / rel
+        pyproject = _repo(repo) / "pyproject.toml"
         if not wf.is_file() or not pyproject.is_file():
             pytest.skip("not the workbench - the sibling repos are not here")
 
@@ -923,8 +891,8 @@ def test_every_published_package_uploads_without_a_stored_credential():
         r"(password\s*:|PYPI_API_TOKEN|PYPI_TOKEN|TWINE_PASSWORD|secrets\.PYPI)")
     problems = []
     for repo in _DEFAULT_SUITE_WORKFLOW:
-        wf = _RELEASE / repo / ".github/workflows/publish.yml"
-        if not (_RELEASE / repo).is_dir():
+        wf = _repo(repo) / ".github/workflows/publish.yml"
+        if not (_repo(repo)).is_dir():
             pytest.skip("not the workbench - the sibling repos are not here")
         if not wf.is_file():
             problems.append(repo + ": no .github/workflows/publish.yml, so it is "
@@ -976,7 +944,7 @@ def test_no_workflow_reads_a_version_its_pyproject_does_not_have():
 
     problems = []
     for repo in _DEFAULT_SUITE_WORKFLOW:
-        root = _RELEASE / repo
+        root = _repo(repo)
         pyproject = root / "pyproject.toml"
         if not pyproject.is_file():
             pytest.skip("not the workbench - the sibling repos are not here")
@@ -1021,7 +989,7 @@ def test_the_workbench_docs_name_no_test_that_does_not_exist():
     if not docs.is_dir():
         pytest.skip("not the workbench - the architecture docs are not here")
     for repo in _DEFAULT_SUITE_WORKFLOW:
-        if not (_RELEASE / repo / "tests").is_dir():
+        if not (_repo(repo) / "tests").is_dir():
             pytest.skip("not the workbench - the sibling repos are not here")
     mod = _citations()
     files, source_present = _citation_files(mod)

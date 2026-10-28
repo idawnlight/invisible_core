@@ -21,8 +21,11 @@ The NAMES are the binary/wrapper contract and never change.
 """
 from __future__ import annotations
 
+import os
+import re
 from typing import NamedTuple
 
+from . import environment
 from ._version import CORE_REVISION, __version__ as PKG_VERSION
 from .seal import DEFAULT_ENTRY_REL, active_seal, normalize_arch
 
@@ -141,9 +144,14 @@ BINARY_ENTRY_REL = dict(DEFAULT_ENTRY_REL)
 # so every consumer fetches from one place: the Playwright wrapper, and until
 # its 2026-08-18 deletion, the direct-launch profile-manager too. (firefox-13
 # and earlier lived on invisible_playwright.)
-RELEASE_URL_TEMPLATE = (
-    "https://github.com/feder-cr/firefox_antidetect_patch/releases/download/{tag}/{asset}"
-)
+def release_url_template(repository: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+", repository):
+        raise ValueError(f"expected a GitHub owner/repository, got {repository!r}")
+    return f"https://github.com/{repository}/releases/download/{{tag}}/{{asset}}"
+
+
+RELEASE_URL_TEMPLATE = release_url_template(os.environ.get(
+    environment.ENGINE_REPOSITORY, "feder-cr/firefox_antidetect_patch"))
 
 # ─────────────────────────────────────────────────────────────────────────
 #  GeoIP database (timezone="auto" → resolve IANA zone from proxy egress IP)

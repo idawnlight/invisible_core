@@ -1,19 +1,6 @@
-"""The launch counter's address is declared by the core, for every session.
+"""Every session declares the counter URL, whose fork default is empty.
 
-The engine fetches a five-byte release asset once at startup and the asset's
-download count is the number of launches. The address was a repository name
-compiled into every shipped binary, and it died twice that way: once when the
-repository was renamed and its old name reused, once when the repository was
-deleted. Since firefox-21 the engine reads it from the pref
-`invisible_firefox.usage_ping.url`, so that moving the counter is a line in
-`prefs.py` and not a rebuild. This is that line, and the tests that keep it.
-
-The address is the engine's own repository: the thing that pings and the
-thing that is counted are the same release series. Engines older than
-firefox-21 do not read the pref and keep asking the address compiled into them.
-
-Known-bad: remove the `setdefault` and the first test goes red on every
-session; point the constant elsewhere and the second does.
+An explicit session URL or enabled setting continues to override the default.
 """
 from __future__ import annotations
 
@@ -33,10 +20,8 @@ def test_every_session_declares_where_to_report_a_launch():
             "to the address compiled into it" % virtual_display)
 
 
-def test_the_address_is_the_engine_repository():
-    assert USAGE_PING_URL == (
-        "https://github.com/feder-cr/firefox_antidetect_patch"
-        "/releases/download/usage-counter/launch.txt")
+def test_the_default_address_matches_the_fork_engine():
+    assert USAGE_PING_URL == ""
 
 
 def test_a_caller_can_still_point_it_elsewhere_or_turn_it_off():

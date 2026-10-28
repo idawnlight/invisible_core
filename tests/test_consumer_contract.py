@@ -53,7 +53,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-_RELEASE = pathlib.Path(__file__).resolve().parents[2]
+from _sibling_repositories import repository_root
 
 #: ONE consumer since 2026-08-18. `invisible_firefox` was deleted that day - the
 #: GitHub repository is gone and so is the checkout beside this one.
@@ -126,7 +126,7 @@ CONTRACT = {
         # it: the launch writes no TZ, and the engine takes the zone from the
         # prefs in every realm. BREAKING for a consumer that still imports it:
         # the wrapper drops its import in the release that moves its pin here.
-        # `tz_env` stays one release, deprecated and doing nothing.
+        # `tz_env` remains exported but is no longer imported by the consumers.
         "_geo", "_headless", "_proxy",
         "_webgl_personas", "config",
         "configure_proxy", "constants", "download", "ensure_binary",
@@ -157,7 +157,6 @@ CONTRACT = {
         "get_default_args", "get_default_stealth_prefs",
         "make_virtual_display", "prefs", "prepare_session_geo",
         "resolve_session_timezone",
-        "tz_env",
         # `LaunchPlan`, `build_launch_plan` and `generate_profile` left on
         # 2026-08-18 with the deletion of `invisible_firefox`, which was the only
         # consumer that imported them: it launched the engine DIRECTLY, so the
@@ -421,7 +420,7 @@ def test_the_frozen_contract_still_matches_the_consumers():
     """
     live: dict = {}
     for consumer in _CONSUMERS:
-        src = _RELEASE / consumer / "src"
+        src = repository_root(consumer, __file__) / "src"
         if not src.is_dir():
             pytest.skip("not the workbench - the consumer is not beside this checkout")
         for mod, names in _imports_in(src).items():

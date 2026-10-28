@@ -44,10 +44,12 @@ from invisible_core import pin
 
 pytestmark = pytest.mark.unit
 
-_RELEASE = pathlib.Path(__file__).resolve().parents[2]
+from _sibling_repositories import repository_root, workspace_root
+
+_RELEASE = workspace_root(__file__)
 _WORKBENCH = _RELEASE.parent
 _SYNC = _WORKBENCH / "scripts" / "sync_core_pin.py"
-_WORKFLOW = _RELEASE / "invisible_playwright" / ".github" / "workflows" / "core-on-index.yml"
+_WORKFLOW = repository_root("invisible_playwright", __file__) / ".github" / "workflows" / "core-on-index.yml"
 
 #: The shapes a real `[project].dependencies` entry can take. Every one of these
 #: has appeared in one of the three repos or in a PEP the resolver implements.

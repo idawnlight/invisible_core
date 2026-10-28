@@ -67,7 +67,7 @@ dependencies = [
 [project.optional-dependencies]
 # The three pytest plugins are the clients' e2e run's (invisible_core.testing.e2e),
 # which tests/test_e2e_run_ends_with_a_verdict.py runs for real.
-dev = ["pytest>=7", "pytest-mock>=3", "responses>=0.24", "build>=1", "ruff>=0.6",
+dev = ["pytest>=7", "pytest-mock>=3", "responses>=0.24", "build>=1", "hatchling", "ruff>=0.6",
        "pytest-rerunfailures>=14", "pytest-timeout>=2", "pytest-xdist>=3"]
 
 [project.scripts]
