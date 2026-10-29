@@ -4,8 +4,8 @@ This fork supplies the profile generator, Firefox preferences, shared Juggler
 client, browser process management, and engine installer used by
 [invisible_playwright](https://github.com/idawnlight/invisible_playwright).
 
-The current pair is `invisible_core 159.49.1` and
-`invisible_playwright 0.43.1`, using Firefox 159.0 from the native
+The current pair is `invisible_core 159.49.2` and
+`invisible_playwright 0.43.2`, using Firefox 159.0 from the native
 [`firefox-159.0-r1` release](https://github.com/idawnlight/firefox_antidetect_patch/releases/tag/firefox-159.0-r1).
 This release provides **Linux x86_64** binaries. Python 3.11 or newer and Git
 are required.
@@ -16,8 +16,8 @@ Install both Python packages from their Git tags using uv:
 uv venv .venv
 . .venv/bin/activate
 uv pip install \
-  "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v159.49.1" \
-  "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@v0.43.1"
+  "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v159.49.2" \
+  "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@v0.43.2"
 ```
 
 Start a session normally:

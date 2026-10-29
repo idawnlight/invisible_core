@@ -45,6 +45,8 @@ import ast
 import json
 import os
 import subprocess
+from dataclasses import replace
+from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
 
 import pytest
@@ -201,6 +203,8 @@ def env(monkeypatch, tmp_path):
         install=InstallSeam(),
         trees=[],
         problems_of=lambda ident, seal: [],
+        repositories={CORE: "https://github.com/feder-cr/invisible_core",
+                      WRAPPER: "https://github.com/feder-cr/invisible_playwright"},
     )
 
     def engine_status(seal=None):
@@ -221,6 +225,29 @@ def env(monkeypatch, tmp_path):
     # test of a fake that agrees with itself.
     monkeypatch.setattr(doctor, "_dist_facts",
                         lambda n: state.facts.get(n, DistFacts(n, False)))
+    # repair_command also reads the distribution's source. Feed that reader
+    # the SAME facts, with explicit repository metadata, instead of letting an
+    # editable fork checkout in the test runner change an index-install case.
+    # Use real metadata records so _fork_distribution itself remains exercised.
+    def distribution(name):
+        name = _pin.normalise_name(name)
+        facts = state.facts.get(name, DistFacts(name, False))
+        if not facts.present:
+            raise PackageNotFoundError(name)
+        path = tmp_path / "metadata" / f"{name}-{facts.version}.dist-info"
+        path.mkdir(parents=True, exist_ok=True)
+        metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {facts.version}\n"
+        if repository := state.repositories.get(name):
+            metadata += f"Project-URL: Repository, {repository}\n"
+        (path / "METADATA").write_text(metadata, encoding="utf-8")
+        direct_url = path / "direct_url.json"
+        if facts.direct_url_raw is None:
+            direct_url.unlink(missing_ok=True)
+        else:
+            direct_url.write_text(facts.direct_url_raw, encoding="utf-8")
+        return Distribution.at(path)
+
+    monkeypatch.setattr(_pin, "_distribution", distribution)
     return state
 
 
@@ -670,6 +697,34 @@ def test_a_stale_install_record_is_told_to_force_reinstall(env, capsys):
     assert _pin.format_command(
         install(CORE, "--force-reinstall", "--no-deps", f"{CORE}=={OTHER}")) in out
     assert "A plain install is a no-op here" in out
+
+
+@pytest.mark.parametrize("source", ["git", "release-wheel"])
+@pytest.mark.parametrize("stale_record", [False, True])
+def test_fork_diagnostics_offer_the_fixed_github_tag(env, capsys, source, stale_record):
+    record = OTHER if stale_record else DERIVED
+    core = index_core(record)
+    if source == "git":
+        payload = {"url": "https://github.com/idawnlight/invisible_core.git",
+                   "vcs_info": {"vcs": "git", "commit_id": "a" * 40,
+                                "requested_revision": f"v{record}"}}
+        core = replace(core, direct_url=payload, direct_url_raw=json.dumps(payload))
+    else:
+        env.repositories[CORE] = "https://github.com/idawnlight/invisible_core"
+    env.facts = {CORE: core, WRAPPER: wrapper_pinning(OTHER),
+                 MANAGER: DistFacts(MANAGER, False)}
+
+    rc = run("--fix")
+    out = capsys.readouterr().out
+
+    requirement = f"{CORE} @ git+https://github.com/idawnlight/invisible_core.git@v{OTHER}"
+    options = ("--force-reinstall", "--no-deps") if stale_record else ()
+    expected = install(CORE, *options, requirement)
+    assert rc == 1
+    assert env.install.formatted == [expected]
+    assert _pin.format_command(expected) in out
+    assert env.install.executed == []
+    assert env.ensure.calls == [] and env.clear.calls == []
 
 
 # ───────────────────── "could not check" is a third verdict, not a pass
