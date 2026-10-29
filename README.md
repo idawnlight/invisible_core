@@ -10,8 +10,23 @@ engine against `src/invisible_core/seal.json`.
 Install the paired core and Playwright checkouts into the same environment:
 
 ```sh
-python -m pip install -e /path/to/invisible_core -e /path/to/invisible_playwright
+uv venv
+uv pip install -e /path/to/invisible_core -e /path/to/invisible_playwright
 ```
+
+Both Python packages can also be installed from fixed Git tags or commits,
+without publishing them to PyPI. Specify both sources in the same install:
+
+```sh
+uv pip install \
+  "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@<core-tag>" \
+  "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@<wrapper-tag>"
+```
+
+The core tag must build the version required by the selected wrapper. This
+repository uses `main`; the engine's Firefox 159 maintenance line is
+`release/159`. Python installation builds the Python packages. The native
+Firefox binary is built and distributed separately.
 
 For this local build, pass `binary_path` to `InvisiblePlaywright`. The seal
 records the Firefox version, BuildID and engine Git commit. Generate it with
