@@ -77,9 +77,9 @@ BUILD_IDS = {
 INFIX = {"win32": "win", "linux": "linux", "darwin": "macos"}
 EXT = {"win32": "zip", "linux": "tar.gz", "darwin": "tar.gz"}
 
-APP_INI = ("[App]\nVendor=Mozilla\nName=Firefox\nVersion={v}\nBuildID={b}\n\n"
+APP_INI = ("[App]\nVendor=Mozilla\nName=Firefox\nVersion={v}\nBuildID={b}\nSourceStamp=0123456789abcdef\n\n"
            "[Gecko]\nMinVersion={v}\nMaxVersion={v}\n")
-PLAT_INI = "[Build]\nBuildID={b}\nMilestone={v}\n"
+PLAT_INI = "[Build]\nBuildID={b}\nMilestone={v}\nSourceStamp=0123456789abcdef\n"
 
 # macOS is no longer a download target: since 2026-08-26 `ensure_binary` refuses
 # on darwin BEFORE it looks at the seal (which for older releases still carries
@@ -149,7 +149,7 @@ def pack(tree_root: Path, dst: Path) -> bytes:
             for p in files:
                 zf.write(p, p.relative_to(tree_root).as_posix())
     else:
-        with tarfile.open(dst, "w:gz") as tf:
+        with tarfile.open(dst, "w:xz" if dst.name.endswith(".xz") else "w:gz") as tf:
             for p in files:
                 tf.add(p, arcname=p.relative_to(tree_root).as_posix())
     return dst.read_bytes()
@@ -262,6 +262,39 @@ def test_cold_path_downloads_verifies_extracts_and_stamps(cache, tmp_path, monke
     assert stamp["build_id"] == build_id, "the stamp must record the leg, not a seal-wide id"
     assert not [d for d in dirs_under(cache) if d.startswith(".tmp-")], \
         "the staging directory must not survive a successful extraction"
+
+
+@responses.activate
+def test_fork_release_tar_xz_downloads_by_default_and_reuses_the_cache(cache, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    arch = host_arch()
+    build_id = BUILD_IDS[("linux", arch)]
+    payload = tmp_path / "payload"
+    build_tree(payload / "firefox", "linux", version="159.0", build_id=build_id)
+    name = f"firefox-159.0.en-US.linux-{arch}.tar.xz"
+    archive = pack(payload, tmp_path / name)
+    seal_path = tmp_path / "release.seal.json"
+    seal_path.write_text(json.dumps({
+        "schema": 2, "tag": "firefox-159.0-r1", "upstream_version": "159.0",
+        "source_commit": "0123456789abcdef", "playwright": {},
+        "assets": {name: {
+            "platform": "linux", "arch": arch, "build_id": build_id,
+            "sha256": hashlib.sha256(archive).hexdigest(), "size": len(archive),
+            "entry_rel": "firefox/firefox", "omni_sha256": "",
+        }},
+    }))
+    seal = load_seal(seal_path)
+    monkeypatch.setattr("invisible_core.download.active_seal", lambda: seal)
+    url = f"https://github.com/idawnlight/firefox_antidetect_patch/releases/download/{seal.tag}/{name}"
+    responses.add(responses.GET, url, body=archive, status=200)
+
+    first = ensure_binary()
+    second = ensure_binary()
+
+    assert first == second == cache_dir_for_seal(seal) / "firefox/firefox"
+    assert first.read_bytes() == b"MZ\x90\x00"
+    assert [call.request.url for call in responses.calls] == [url]
+    assert read_stamp(cache_dir_for_seal(seal))["asset_sha256"] == hashlib.sha256(archive).hexdigest()
 
 
 @pytest.mark.parametrize("plat", PLATFORMS)

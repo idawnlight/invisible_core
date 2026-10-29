@@ -1,46 +1,59 @@
-# Invisible Core for Firefox 159
+# Invisible Core
 
-This branch pairs `invisible_core 159.49.0` with the local Firefox 159.0
-implementation and `invisible_playwright 0.43.1.dev0`.
+This fork supplies the profile generator, Firefox preferences, shared Juggler
+client, browser process management, and engine installer used by
+[invisible_playwright](https://github.com/idawnlight/invisible_playwright).
 
-The core generates session profiles and Firefox preferences, owns the shared
-Juggler protocol client, starts and tracks browser processes, and verifies the
-engine against `src/invisible_core/seal.json`.
+The current pair is `invisible_core 159.49.1` and
+`invisible_playwright 0.43.1`, using Firefox 159.0 from the native
+[`firefox-159.0-r1` release](https://github.com/idawnlight/firefox_antidetect_patch/releases/tag/firefox-159.0-r1).
+This release provides **Linux x86_64** binaries. Python 3.11 or newer and Git
+are required.
 
-Install the paired core and Playwright checkouts into the same environment:
-
-```sh
-uv venv
-uv pip install -e /path/to/invisible_core -e /path/to/invisible_playwright
-```
-
-Both Python packages can also be installed from fixed Git tags or commits,
-without publishing them to PyPI. Specify both sources in the same install:
+Install both Python packages from their Git tags in one command:
 
 ```sh
-uv pip install \
-  "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@<core-tag>" \
-  "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@<wrapper-tag>"
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install \
+  "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v159.49.1" \
+  "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@v0.43.1"
 ```
 
-The core tag must build the version required by the selected wrapper. This
-repository uses `main`; the engine's Firefox 159 maintenance line is
-`release/159`. Python installation builds the Python packages. The native
-Firefox binary is built and distributed separately.
+Start a session normally:
 
-For this local build, pass `binary_path` to `InvisiblePlaywright`. The seal
-records the Firefox version, BuildID and engine Git commit. Generate it with
-the engine's `scripts/make_seal.py --from-tree`, then update the exact core
-dependency in the wrapper.
+```python
+from invisible_playwright import InvisiblePlaywright
 
-For published archives, generate a seal with asset names, hashes, sizes and
-per-platform BuildIDs. `INVISIBLE_FIREFOX_RELEASE_REPOSITORY=owner/repository`
-selects the GitHub repository used by both release downloads and API lookup.
+with InvisiblePlaywright(seed=42, headless=True) as browser:
+    page = browser.new_page()
+    page.goto("https://example.com")
+    print(page.title())
+```
 
-`invisible-core doctor` reports the package and engine pair. The existing
-unit, integration and browser tests live under `tests/`; source contracts
-inspect the engine commit recorded in the seal. Sibling repository checks
-select worktrees on the same branch.
+The first session downloads Firefox from the fork's GitHub Release. The
+bundled seal selects the exact asset and records its SHA256, Firefox version,
+BuildID, and source commit. The installer checks these values and reuses the
+verified cache on later starts. Applications need no local Firefox build,
+`binary_path`, or release-repository environment variable.
+
+The [installation guide](https://github.com/idawnlight/invisible_playwright/blob/main/docs/installation.md)
+includes Linux runtime dependencies and installation details. To download the
+engine through the core alone:
+
+```sh
+python -c 'from invisible_core import ensure_binary; print(ensure_binary())'
+```
+
+Both Python repositories use `main` and their own version tags. The native
+Firefox repository maintains `release/159`; its engine tags, such as
+`firefox-159.0-r1`, are independent of the Python package versions. Updating
+the default bundled seal requires a new core package version and the matching
+wrapper dependency pin.
+
+For development, install the two checkouts together with `pip install -e`.
+The unit and integration suites are under `tests/`; release workflows build
+and check the wheel and sdist before uploading them to GitHub Releases.
 
 The package's original code is MIT. Its shared Juggler client retains the
 licenses recorded alongside the source.

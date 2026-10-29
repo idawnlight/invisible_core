@@ -57,8 +57,8 @@ from .launch import tz_env, LaunchPlan, build_launch_env, build_launch_plan, wri
 
 # One headline version, and it is the honest one.
 #
-# `__version__` is DERIVED from the seal this package ships (invisible_core/
-# seal.json -> _version.py), so it describes the code that is about to run. That
+# `__version__` is declared in this package's _version.py, so it describes the
+# Python code that is about to run independently of its default engine. That
 # is the number to put in a bug report, and the number every consumer pins with
 # `invisible-core==`.
 #

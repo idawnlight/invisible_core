@@ -1,28 +1,4 @@
-"""The publish gate is WIRED, and these tests are what keeps it wired.
-
-The gate itself was written first and connected to nothing: `grep -rn
-version_gate` over the whole workbench found the script, its own test file and a
-comment in pyproject.toml, and every path that could actually reach an upload
-went around it. There was no .github/ and no pre-push hook in the repo at all.
-A gate somebody has to remember is a runbook note wearing a gate's clothes.
-
-Three layers now stand between a working tree and the index, and each one is
-asserted here so it cannot quietly rot:
-
-  1. `version_gate.py publish` - the only supported upload path. It runs `check`
-     in-process and never reaches twine on a refusal (proved in
-     test_release_gate.py, which drives it against real known-bad trees).
-  2. .github/workflows/publish.yml - the index credential lives in a GitHub
-     Environment that only the upload job names, and that job declares
-     `needs: gate`. Without a green gate the job holding the credential never
-     starts. There is no step ordering to get wrong.
-  3. .githooks/pre-push - refuses to push a release tag whose gate is red, so
-     the tag that starts (2) never leaves the machine.
-
-These are structural assertions over files, deliberately: a test that spun up a
-real GitHub Actions run or pushed a real tag would not run anywhere, and a
-wiring check that does not run is the thing being fixed.
-"""
+"""GitHub artifact publishing and the real pre-push hook remain connected."""
 from __future__ import annotations
 
 import re
@@ -76,86 +52,66 @@ def test_the_hook_is_tracked_as_executable():
 
 @requires_checkout
 def test_the_upload_job_cannot_start_without_the_gate_job():
-    """The load-bearing property of the workflow: the job holding the credential
-    cannot start unless the gate job succeeded.
-
-    Parsed as YAML, not matched as a string. The first version required the
-    literal `needs: gate` and went red the moment a second dependency was added
-    (`needs: [already-published, gate]`) even though the property it exists to
-    protect was untouched. A test that fails on a formatting change it does not
-    care about is a test people edit without reading.
-    """
-    import yaml
-
-    spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    jobs = spec.get("jobs") or {}
-    assert "upload" in jobs, "the publish workflow has no `upload` job"
-    upload = jobs["upload"]
-
-    needs = upload.get("needs")
-    needs = [needs] if isinstance(needs, str) else list(needs or [])
-    assert "gate" in needs, (
-        f"the upload job declares needs={needs!r}, which does not include the "
-        f"gate, so it can run past a red one")
-
-    assert str(upload.get("environment", "")).startswith("pypi"), \
-        "the upload job does not name the environment the credential lives in"
-
-    steps = " ".join(str(s.get("run", "")) for s in upload.get("steps", []))
-    assert "version_gate.py publish" in steps, \
-        "the upload job does not go through the gate's own publish path"
-
-
-@requires_checkout
-def test_the_index_probe_gates_both_other_jobs():
-    """The guard added on 2026-07-26 is only a guard if BOTH jobs honour it.
-
-    It exists so a tag naming a version already on the index is a no-op rather
-    than a failed upload. If `upload` kept running when the probe says the
-    version is present, the guard would be decoration and the upload would fail
-    on a filename the index has already served.
-    """
     import yaml
 
     jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
-    assert "already-published" in jobs, "the index probe job is gone"
-    for name in ("gate", "upload"):
-        job = jobs[name]
-        needs = job.get("needs")
-        needs = [needs] if isinstance(needs, str) else list(needs or [])
-        assert "already-published" in needs, (
-            f"`{name}` does not depend on the index probe, so it runs even when "
-            f"the version is already published")
-        cond = str(job.get("if", ""))
-        assert "already-published" in cond and "present" in cond, (
-            f"`{name}` has no condition on the probe's answer: {cond!r}")
+    upload = jobs["upload"]
+    needs = upload.get("needs")
+    assert "gate" in ([needs] if isinstance(needs, str) else needs)
+    assert upload["permissions"]["contents"] == "write"
+    assert jobs["gate"].get("permissions", {}).get("contents") != "write"
+    assert any(step.get("uses", "").startswith("actions/download-artifact@")
+               for step in upload["steps"])
+
+
+
+@requires_checkout
+def test_github_releases_do_not_require_a_python_index_publication():
+    import yaml
+
+    text = WORKFLOW.read_text(encoding="utf-8")
+    jobs = yaml.safe_load(text)["jobs"]
+    assert "already-published" not in jobs
+    assert "pypi.org" not in text
+    assert "pypi-publish" not in text
+    assert "id-token" not in text
+    assert "twine" not in text
+
 
 
 @requires_checkout
 def test_no_job_uploads_without_going_through_the_gate():
-    """Any `twine upload` written directly into the workflow would be an upload
-    path the gate does not sit in front of."""
-    text = WORKFLOW.read_text(encoding="utf-8")
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        assert "twine upload" not in stripped, (
-            f"the workflow uploads directly, around the gate: {stripped!r}\n"
-            "  use `version_gate.py publish`, which runs the gate in-process first.")
-        assert "pypi-publish" not in stripped, (
-            f"a publish action bypasses the gate entirely: {stripped!r}")
+    import yaml
+
+    jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+    publishers = []
+    for name, job in jobs.items():
+        commands = "\n".join(step.get("run", "") for step in job.get("steps", []))
+        if "gh release create" in commands or "gh release upload" in commands:
+            publishers.append(name)
+            needs = job.get("needs")
+            assert "gate" in ([needs] if isinstance(needs, str) else needs or [])
+            assert "sha256sum --check SHA256SUMS" in commands
+    assert publishers == ["upload"]
+
 
 
 @requires_checkout
-def test_the_gate_job_runs_the_gate_and_the_checkout_brings_the_ledger():
-    text = WORKFLOW.read_text(encoding="utf-8")
-    gate_job = text.split("\n  gate:", 1)[1].split("\n  upload:", 1)[0]
-    assert "version_gate.py check" in gate_job
-    # A shallow checkout that dropped PUBLISHED.json is one of the ways the gate
-    # used to disarm itself silently. It now exits 4, but not having the file at
-    # all in CI would just mean every release run fails.
-    assert "fetch-depth: 0" in gate_job
+def test_the_gate_tests_and_builds_the_tagged_source_before_artifact_upload():
+    import yaml
+
+    gate = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["gate"]
+    steps = gate["steps"]
+    checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout@"))
+    assert "RELEASE_TAG" in checkout["with"]["ref"]
+    runs = [step.get("run", "") for step in steps]
+    test_index = next(i for i, run in enumerate(runs) if "python -m pytest" in run)
+    build_index = next(i for i, run in enumerate(runs) if "python -m invisible_core.github_release" in run)
+    artifact_index = next(i for i, step in enumerate(steps)
+                          if step.get("uses", "").startswith("actions/upload-artifact@"))
+    assert test_index < build_index < artifact_index
+    assert '--tag "$RELEASE_TAG"' in runs[build_index]
+
 
 
 # ------------------------------------------------------------------ layer 3
@@ -350,47 +306,12 @@ def _env():
 
 
 @requires_checkout
-def test_the_hook_and_the_workflow_agree_on_what_a_release_tag_means(tmp_path):
-    """Both layers ask the INDEX, so neither can block what the other allows.
+def test_the_hook_and_workflow_use_the_github_release_backend():
+    import tomllib
 
-    They did not always. The first release tag ever pushed here was refused by
-    this hook and would have been waved through by the workflow: the hook ran
-    the gate against the WORKING TREE, which has legitimately moved on since the
-    tagged version was published, so it read as "the content changed under an
-    unmoved version" - for a tag that was simply marking something already
-    shipped. A local layer that blocks what CI would accept is a layer people
-    switch off, and switching this one off disables the rest of it too.
-
-    THE HOOK'S HALF MOVED. It used to curl the index itself and exit 0 on a
-    200, which answers a weaker question than the gate does - present on the
-    index, versus present AND byte-identical - and answers it from a second
-    source of truth. It now runs the gate with `--verify-index` and reads the
-    answer: exit 5 is the no-op, exit 2 is an index it could not reach, and
-    only the first of those lets the tag through. Those two branches are
-    asserted directly, against a policy driven with each code in turn, in
-    test_hook_policy.py. Asserting them here as well would be a second, weaker
-    copy - which is what the deleted half of this test had become.
-
-    What is left here is the workflow, which still asks the index itself, and
-    the claim that the two layers cannot disagree.
-    """
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert config["tool"]["invisible"]["hooks"]["release_backend"] == "github"
     workflow = WORKFLOW.read_text(encoding="utf-8")
-
-    assert "pypi.org/pypi/invisible-core/" in workflow, (
-        "the workflow does not ask the index whether the version is already "
-        "published, so the two layers can disagree about a tag again")
-    assert '200' in workflow, (
-        "the workflow does not branch on the index answering 200 (published)")
-
-    # An unreachable index must not read as "not published": that is the
-    # direction that authorises an upload nobody checked.
-    assert "neither" in workflow and "guessing" in workflow, (
-        "the workflow treats an unreachable index as a definite answer")
-
-    # The hook's side of the same claim, read from the policy rather than from
-    # its prose: an already-published tag is a no-op, a broken gate is not.
-    from invisible_core import hooks
-
-    assert hooks.GATE_NOTHING_TO_DO == 5, (
-        "the no-op code moved; the hook and the gate now disagree about what a "
-        "re-pushed release tag means")
+    assert "python -m invisible_core.github_release" in workflow
+    assert "gh release create" in workflow
+    assert "--verify-tag" in workflow

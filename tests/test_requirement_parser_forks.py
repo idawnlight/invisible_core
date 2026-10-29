@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import tomllib
 
 import pytest
 
@@ -49,7 +50,9 @@ from _sibling_repositories import repository_root, workspace_root
 _RELEASE = workspace_root(__file__)
 _WORKBENCH = _RELEASE.parent
 _SYNC = _WORKBENCH / "scripts" / "sync_core_pin.py"
-_WORKFLOW = repository_root("invisible_playwright", __file__) / ".github" / "workflows" / "core-on-index.yml"
+_WRAPPER = repository_root("invisible_playwright", __file__)
+_WORKFLOW = _WRAPPER / ".github/workflows/core-on-index.yml"
+_BOOTSTRAP = _WRAPPER / "scripts/core_requirement.py"
 
 #: The shapes a real `[project].dependencies` entry can take. Every one of these
 #: has appeared in one of the three repos or in a PEP the resolver implements.
@@ -62,6 +65,7 @@ _REQUIREMENTS = [
     "invisible-core==18.8.0",
     "invisible_core==18.8.0",
     "invisible-core == 18.8.0",
+    " Invisible.Core [geo, dev] ( == 18.8.0 ) ; python_version >= '3.11'",
     "invisible-core[extra]==18.8.0",
     "invisible-core==18.8.0 ; python_version >= '3.10'",
     "invisible-core>=18.0.0",
@@ -121,57 +125,34 @@ def test_the_sync_script_normalises_names_exactly_as_the_package_does():
                              for n, (a, b) in differing.items()))
 
 
+def _workflow_parser():
+    config = tomllib.loads((_WRAPPER / "pyproject.toml").read_text(encoding="utf-8"))
+    backend = config["tool"]["invisible"]["hooks"].get("release_backend", "pypi")
+    if backend == "github":
+        assert "scripts/core_requirement.py" in _WORKFLOW.read_text(encoding="utf-8")
+        ns = _exec_block(_BOOTSTRAP.read_text(encoding="utf-8"),
+                         ["normalise_name", "parse_core_pin", "_REQ_RE", "_PIN_RE"])
+        return ns["normalise_name"], lambda req: (parsed["version"] if (parsed := ns["parse_core_pin"](req)) else None)
+    ns = _exec_block(_inline_python(_WORKFLOW.read_text(encoding="utf-8")), ["norm", "PIN_RE"])
+    return ns["norm"], lambda req: (match.group("version") if (match := ns["PIN_RE"].match(req))
+        and ns["norm"](match.group("name")) == "invisible-core" else None)
+
+
 @pytest.mark.skipif(not _WORKFLOW.is_file(), reason="not the workbench")
-def test_the_workflows_inline_parser_agrees_with_the_package():
-    ns = _exec_block(_inline_python(_WORKFLOW.read_text(encoding="utf-8")),
-                     ["norm", "PIN_RE"])
-
-    differing = {n: (pin.normalise_name(n), ns["norm"](n))
-                 for n in _NAMES if pin.normalise_name(n) != ns["norm"](n)}
-    assert not differing, (
-        "core-on-index.yml's norm() disagrees with the package:\n  " +
-        "\n  ".join(f"{n}: package={a!r} workflow={b!r}"
-                    for n, (a, b) in differing.items()))
-
-    # And the specifier half: for each shape, does the workflow see the same
-    # "this is invisible-core pinned to exactly V" that the package sees?
-    disagree = []
-    for req in _REQUIREMENTS:
-        parsed = pin.parse_requirement(req)
-        ours = None
-        if parsed is not None and pin.normalise_name(parsed.name) == "invisible-core":
-            spec = getattr(parsed, "specifier", "") or ""
-            if spec.startswith("==") and "," not in spec:
-                ours = spec[2:]
-        m = ns["PIN_RE"].match(req)
-        theirs = (m.group("version")
-                  if m and ns["norm"](m.group("name")) == "invisible-core" else None)
-        if ours != theirs:
-            disagree.append(f"{req!r}: package={ours!r} workflow={theirs!r}")
-    assert not disagree, (
-        "the workflow and the package read different pins out of the same "
-        "requirement strings:\n  " + "\n  ".join(disagree) +
-        "\n\nA shape the workflow misses stops CI on a correctly pinned repo; a "
-        "shape it wrongly accepts lets CI go green on a pin that fails at import.")
+def test_the_workflow_bootstrap_parser_agrees_with_the_package():
+    normalise, version = _workflow_parser()
+    for name in _NAMES:
+        assert normalise(name) == pin.normalise_name(name), name
+    for requirement in _REQUIREMENTS:
+        parsed = pin.parse_requirement(requirement)
+        ours = parsed.pinned if parsed and parsed.name == "invisible-core" else None
+        assert version(requirement) == ours, requirement
 
 
 @pytest.mark.skipif(not _WORKFLOW.is_file(), reason="not the workbench")
 def test_the_comparison_is_not_vacuous():
-    """Its known-bad input, twice over.
-
-    If `_exec_block` returned an empty namespace, or if `_REQUIREMENTS` held no
-    shape that actually pins the core, both tests above would pass over nothing -
-    which is the empty-set failure this codebase keeps finding in its own gates.
-    """
-    ns = _exec_block(_inline_python(_WORKFLOW.read_text(encoding="utf-8")),
-                     ["norm", "PIN_RE"])
-    assert ns["norm"]("Invisible_Core") == "invisible-core"
-    assert ns["PIN_RE"].match("invisible-core==18.8.0").group("version") == "18.8.0"
-
-    pinned = [r for r in _REQUIREMENTS
-              if (p := pin.parse_requirement(r)) is not None
-              and pin.normalise_name(p.name) == "invisible-core"
-              and (getattr(p, "specifier", "") or "").startswith("==")]
-    assert len(pinned) >= 4, (
-        f"only {len(pinned)} of the shapes tried are actually an exact core pin, "
-        f"so the specifier comparison is barely exercised: {pinned}")
+    normalise, version = _workflow_parser()
+    assert normalise("Invisible_Core") == "invisible-core"
+    assert version("invisible-core==18.8.0") == "18.8.0"
+    pinned = [requirement for requirement in _REQUIREMENTS if version(requirement)]
+    assert len(pinned) >= 4, pinned

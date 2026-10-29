@@ -10,6 +10,8 @@
 # core's pre-push gate and its publish gate were both green over all six.
 #
 # `test_no_test_reaches_the_core_through_a_shim` in the wrapper keeps them here.
+from dataclasses import replace
+
 import pytest
 
 from invisible_core.constants import (
@@ -21,7 +23,21 @@ from invisible_core.constants import (
     FIREFOX_UPSTREAM_VERSION,
     RELEASE_URL_TEMPLATE,
 )
-from invisible_core.seal import SUPPORTED_LEGS
+from invisible_core.seal import Asset, SUPPORTED_LEGS, active_seal
+
+
+@pytest.fixture
+def complete_archive_seal(monkeypatch):
+    """The archive mapping supports more legs than each individual release ships."""
+    import invisible_core.constants as constants
+
+    assets = {}
+    for platform, arch in SUPPORTED_LEGS:
+        suffix = f"win-{arch}.zip" if platform == "win32" else f"linux-{arch}.tar.gz"
+        name = f"{BINARY_BASENAME}-{suffix}"
+        assets[name] = Asset(name, platform, arch, "0" * 64, 1,
+                             BINARY_ENTRY_REL[platform], "", "20261029033851")
+    monkeypatch.setattr(constants, "_SEAL", replace(constants._SEAL, assets=assets))
 
 
 @pytest.mark.unit
@@ -48,12 +64,12 @@ def test_broken_versions_is_retired_but_still_importable():
 
 @pytest.mark.unit
 def test_binary_version_format():
-    assert BINARY_VERSION.startswith("firefox-")
-    assert BINARY_VERSION.split("-", 1)[1].isdigit()
+    assert BINARY_VERSION == active_seal().tag
+    assert active_seal().is_release
 
 
 @pytest.mark.unit
-def test_archive_name_windows():
+def test_archive_name_windows(complete_archive_seal):
     name = ARCHIVE_NAME("win32", "AMD64")
     assert name.endswith(".zip")
     assert "win-x86_64" in name
@@ -112,7 +128,7 @@ def test_binary_basename_format():
     ("Linux",  "x86_64",    "linux-x86_64.tar.gz"),  # case-insensitive platform
     ("WIN32",  "AMD64",     "win-x86_64.zip"),       # ALL CAPS platform
 ])
-def test_archive_name_accepts_case_variations(platform_key, machine, expected_substring):
+def test_archive_name_accepts_case_variations(complete_archive_seal, platform_key, machine, expected_substring):
     """sys.platform / platform.machine() return inconsistent casing across
     OS versions and Python versions. The asset filename must be stable
     regardless - otherwise the CDN 404s."""
@@ -131,7 +147,7 @@ def test_archive_name_rejects_unsupported_arches(machine):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("machine", ["arm64", "aarch64"])
-def test_archive_name_arm64_supported(machine):
+def test_archive_name_arm64_supported(complete_archive_seal, machine):
     """ARM64 is shipped now (issue #6): Linux aarch64 - e macOS arm64 fino a
     `firefox-20`, uscito il 2026-08-26.
     ARCHIVE_NAME must map both machine spellings to the canonical -arm64 asset.
@@ -161,7 +177,7 @@ def test_archive_name_rejects_unsupported_platforms(platform_key):
 # already downloaded a 110 MB tarball - terrible UX.
 
 @pytest.mark.unit
-def test_binary_entry_rel_covers_every_supported_platform():
+def test_binary_entry_rel_covers_every_supported_platform(complete_archive_seal):
     """If ARCHIVE_NAME accepts a platform key, BINARY_ENTRY_REL must declare
     where the executable lives inside the archive for it.
 
@@ -219,7 +235,7 @@ def test_release_url_points_at_owned_repo():
     """The template MUST point at an owner/repo the maintainer actually
     controls. A typo here would direct everyone's downloads at a stranger's
     GitHub account - silent supply-chain risk."""
-    assert "/feder-cr/firefox_antidetect_patch/" in RELEASE_URL_TEMPLATE, (
+    assert "/idawnlight/firefox_antidetect_patch/" in RELEASE_URL_TEMPLATE, (
         f"RELEASE_URL_TEMPLATE was changed to point elsewhere: "
         f"{RELEASE_URL_TEMPLATE!r}. Update this test only if the move is intentional."
     )
@@ -246,6 +262,19 @@ def test_binary_basename_includes_upstream_version():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("plat", ["win32", "linux"])
-def test_archive_name_includes_upstream_version(plat):
+def test_archive_name_includes_upstream_version(complete_archive_seal, plat):
     """Same desync guard, from the other direction."""
     assert FIREFOX_UPSTREAM_VERSION in ARCHIVE_NAME(plat, "x86_64")
+
+
+@pytest.mark.unit
+def test_default_archive_names_cover_exactly_the_legs_the_release_ships():
+    seal = active_seal()
+    for platform, arch in SUPPORTED_LEGS:
+        try:
+            asset = seal.asset_for(platform, arch)
+        except NotImplementedError:
+            with pytest.raises(NotImplementedError):
+                ARCHIVE_NAME(platform, arch)
+        else:
+            assert ARCHIVE_NAME(platform, arch) == asset.name

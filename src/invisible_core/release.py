@@ -537,16 +537,9 @@ def _report_diff(label: str, d: dict[str, list[str]]) -> list[str]:
 
 
 REMEDY = """
-  Two remedies are legal, and exactly one of them fits:
-
-    1. A core-only fix against the SAME engine
-       bump CORE_REVISION in src/invisible_core/_version.py (it is the only
-       hand-edited number in the package). {cur} -> {next_rev}
-       Never reset it: pip compares with != , not <.
-
-    2. The engine moved
-       roll a new seal (a new firefox-N tag in src/invisible_core/seal.json).
-       The version follows the tag on its own, no hand edit.
+  Bump __version__ in src/invisible_core/_version.py: {cur} -> {next_rev}.
+  The Python package version is independent of the engine tag. A change to
+  the bundled seal is shipped content and also needs a new package version.
 
   Then re-run: python scripts/version_gate.py check
 """
@@ -572,7 +565,7 @@ CONSUMER_REMEDY = """
 def _remedy(version: str) -> str:
     p = _parse_version(version)
     if PKG_NAME == "invisible_core":
-        nxt = f"{p[0]}.{p[1] + 1}.0" if p else "the next revision"
+        nxt = f"{p[0]}.{p[1]}.{p[2] + 1}" if p else "the next version"
         return REMEDY.format(cur=version, next_rev=nxt)
     nxt = f"{p[0]}.{p[1]}.{p[2] + 1}" if p else "the next version"
     return CONSUMER_REMEDY.format(cur=version, next_rev=nxt)
@@ -671,8 +664,7 @@ def cmd_check(args) -> int:
         print("  The flag exists to be used exactly once. Drop it.")
         return EXIT_REFUSED
 
-    # Monotonicity. The version scheme is derived, but CORE_REVISION is hand
-    # edited, and a reset produces a version collision explained badly.
+    # Published package versions advance independently of engine tags.
     cur = _parse_version(version)
     if cur is not None:
         newest = max(
@@ -681,7 +673,7 @@ def cmd_check(args) -> int:
         if newest is not None and cur < newest:
             hi = ".".join(str(x) for x in newest)
             print(f"\nRELEASE REFUSED: version went BACKWARDS. {version} < {hi}, already published.")
-            print("  CORE_REVISION was reset, or the seal tag moved down. pip compares")
+            print("  The package's __version__ moved backwards. pip compares")
             print("  with != , not <, so a version that goes backwards is not an")
             print("  upgrade for anybody and the index will not accept it twice.")
             return EXIT_REFUSED

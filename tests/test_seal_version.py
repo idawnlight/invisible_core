@@ -1,20 +1,4 @@
-"""The seal is the only version surface, and it is the one pip compares.
-
-Spec: docs/firefox-stealth-architecture/17-release-seal-spec.md sections 3.2 (7),
-4.7, 4.8, 4.9 and 7. Audit: 16-version-divergence-matrix.md section 4 (2) and S1.
-
-Cells closed here:
-  S1  the core's pip-visible version never moved, so pip's resolver hit
-      `else: continue` and skipped the upgrade on every install for a year.
-      The derived version is the mechanism that makes the upgrade take, so it
-      is tested as a mechanism: a different tag MUST produce a different string.
-  D8-adjacent  the claim (User-Agent) is a projection of the seal, including on
-      the INVISIBLE_SEAL_FILE escape hatch, which therefore cannot decouple the
-      claim from the engine - it can only move both.
-
-No network, no browser, no build. The derivation is exercised by executing the
-shipped _version.py against synthetic seals in tmp_path.
-"""
+"""The Python package version and its default engine seal are independent."""
 from __future__ import annotations
 
 import json
@@ -70,32 +54,22 @@ def run_version_module(tmp_path: Path, tag: str) -> dict:
 
 # ------------------------------------------------- the mechanism pip relies on
 
-def test_pip_version_moves_when_the_seal_tag_moves(tmp_path):
-    """pip's resolver reinstalls a git dependency only when
-    `installed_dist.version != candidate.version`. If the string does not move
-    on a binary bump, the core is skipped and the user keeps the old engine
-    contract forever. This is that string, and it must move."""
+def test_python_version_does_not_depend_on_the_engine_tag(tmp_path):
     v18 = run_version_module(tmp_path, "firefox-18")
     v19 = run_version_module(tmp_path, "firefox-19")
-    rev = v18["CORE_REVISION"]
-
-    assert v18["__version__"] == f"18.{rev}.0"
-    assert v19["__version__"] == f"19.{rev}.0"
-    assert v18["__version__"] != v19["__version__"], "a tag bump that pip cannot see"
+    current = run_version_module(tmp_path, "firefox-159.0-r1")
+    assert v18["__version__"] == v19["__version__"] == current["__version__"]
+    assert current["__version__"] == invisible_core.__version__
 
 
-def test_core_revision_moves_the_version_for_a_core_only_release(tmp_path):
-    """A pure-Python fix against the same engine still has to reach users, which
-    is what CORE_REVISION is for. Same seal, different revision, different
-    string."""
+def test_explicit_package_version_moves_for_a_core_only_release(tmp_path):
     src = (PKG_DIR / "_version.py").read_text(encoding="utf-8")
-    assert "CORE_REVISION" in src
     home = tmp_path / "rev"
     make_seal_json(home, tag="firefox-18")
     out = []
     for rev in (0, 1):
         patched = "\n".join(
-            f"CORE_REVISION = {rev}" if line.strip().startswith("CORE_REVISION")
+            f'__version__ = "1.0.{rev}"' if line.strip().startswith("__version__ =")
             else line for line in src.splitlines())
         ns = {"__file__": str(home / "_version.py"), "__name__": "_probe"}
         exec(compile(patched, str(home / "_version.py"), "exec"), ns)
@@ -103,13 +77,10 @@ def test_core_revision_moves_the_version_for_a_core_only_release(tmp_path):
     assert out[0] != out[1], out
 
 
-def test_packaged_version_is_the_packaged_seal(tmp_path):
-    """No second literal: what the package reports is what its own seal says."""
+def test_package_headline_version_is_the_declared_python_version(tmp_path):
     from invisible_core import _version
 
-    seal = load_seal(packaged_seal_path())
-    n = int(seal.tag.split("-")[1])
-    assert _version.__version__ == f"{n}.{_version.CORE_REVISION}.0"
+    assert invisible_core.__version__ == _version.__version__
 
 
 @needs_sources
@@ -135,7 +106,7 @@ def test_seal_json_sits_inside_the_package(tmp_path):
     assert p.exists(), f"no seal shipped at {p}"
     assert p.parent == PKG_DIR
     seal = load_seal(p)
-    assert seal.tag.startswith("firefox-") and seal.tag.split("-")[1].isdigit()
+    assert seal.is_release
     assert seal.upstream_version and seal.build_id
     assert seal.digest and len(seal.digest) == 64
 
@@ -279,6 +250,9 @@ def test_a_local_tagged_seal_can_actually_be_imported(tmp_path):
     (6, "firefox-18.1", 0, False),
     (7, "my-build-3", 0, False),
     (8, "firefox-18-rc1", 0, False),
+    (9, "firefox-159.0-r1", 0, True),
+    (10, "firefox-159.0.1-r2", 0, True),
+    (11, "firefox-159.0-r0", 0, False),
 ])
 def test_contract_n_answers_instead_of_raising(tmp_path, i, tag, n, release):
     """Read at import time, so it may never raise for any tag anyone can type.

@@ -28,8 +28,8 @@ WHAT IS COMPARED, and why this pair rather than the obvious one.
            whose metadata is frozen at install time, and from its metadata
            otherwise (pin_declaration). One source, no constant in code to
            drift.
-  HAVE     invisible_core._version.__version__, recomputed from the packaged
-           seal.json on every import. This is the truth of the code that will
+  HAVE     invisible_core._version.__version__, declared in the Python package.
+           This is the version of the code that will
            execute, and it is read by importing this package's own sibling
            module, never through importlib.metadata.
   RECORDED importlib.metadata.version("invisible-core"), the installer's
@@ -110,6 +110,7 @@ the module that renders it, whatever version the repair put on disk.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -471,8 +472,8 @@ def installed_consumers() -> list:
 def installed_core_version() -> Optional[str]:
     """The version of the core code that will actually run, derived live.
 
-    Read from the sibling _version module, which recomputes the version from the
-    packaged seal.json (seal tag + CORE_REVISION) on every import.
+    Read from the sibling _version module, which declares the Python package
+    version independently of the bundled engine seal.
 
     There is deliberately NO fallback to invisible_core.__version__: that
     attribute is importlib.metadata.version("invisible-core"), i.e. the
@@ -558,12 +559,7 @@ def core_modules_loaded() -> tuple:
         if m == "invisible_core" or m.startswith("invisible_core.")))
 
 
-# The file the derived version actually comes from. Named in the messages
-# because the previous wording blamed seal.json, which is only half of it: the
-# version is <seal tag number>.<CORE_REVISION>.0 and CORE_REVISION is a literal
-# in _version.py, so a wrong version can come from either file and the user has
-# to be told which one to open.
-_DERIVED_FROM = "invisible_core/_version.py, from seal.json + CORE_REVISION"
+_DERIVED_FROM = "invisible_core/_version.py, __version__"
 
 #: How a version that could not be derived at all is rendered. It is not a
 #: separate branch any more: a core that cannot derive its version cannot be
@@ -609,7 +605,7 @@ def pin_problem(
             f"  {consumer} requires  {CORE_NAME}=={want}\n"
             f"  editable source     {editable_path}\n"
             f"  that tree builds    {CORE_NAME} {shown}   ({_DERIVED_FROM})\n"
-            f"Repairing this replaces the editable install with a copy from the index: "
+            f"Repairing this replaces the editable install with a released copy: "
             f"the tree above stays on disk, but imports stop coming from it and edits "
             f"in it stop having any effect. To reattach it afterwards:\n"
             f"  {format_command(install(CORE_NAME, '-e', str(editable_path)))}\n"
@@ -630,7 +626,7 @@ def pin_problem(
             f"report this environment as healthy. The files are what actually runs, "
             f"and a plain install is a no-op here because the installer believes "
             f"{want} is already present.\n"
-            f"Run: {format_command(repair_command(want, recorded))}"
+            f"Run: {format_command(repair_command(want, recorded, dist_name=dist_name))}"
         )
 
     return (
@@ -643,14 +639,47 @@ def pin_problem(
         f"An install that skipped dependency resolution is the usual cause: "
         f"an install with --no-deps, or a lockfile that pins the two packages "
         f"separately.\n"
-        f"Run: {format_command(repair_command(want, recorded))}"
+        f"Run: {format_command(repair_command(want, recorded, dist_name=dist_name))}"
     )
 
 
-def repair_command(want: str, recorded: Optional[str]) -> list:
+def _fork_distribution(dist_name: str) -> Optional[bool]:
+    repositories = {CORE_NAME: "invisible_core", "invisible-playwright": "invisible_playwright"}
+    repository = repositories.get(normalise_name(dist_name))
+    if repository is None:
+        return False
+    try:
+        dist = _distribution(dist_name)
+        raw = dist.read_text("direct_url.json")
+        try:
+            direct = json.loads(raw) if raw else {}
+        except ValueError:
+            direct = {}
+        if not isinstance(direct, dict):
+            direct = {}
+        vcs = direct.get("vcs_info") or {}
+        if isinstance(vcs, dict) and vcs.get("vcs") == "git":
+            return direct.get("url") in (
+                f"https://github.com/idawnlight/{repository}",
+                f"https://github.com/idawnlight/{repository}.git")
+        urls = dist.metadata.get_all("Project-URL", [])
+        return any(value.partition(",")[0].strip().lower() == "repository" and
+                   value.partition(",")[2].strip().rstrip("/") in (
+                       f"https://github.com/idawnlight/{repository}",
+                       f"https://github.com/idawnlight/{repository}.git") for value in urls)
+    except PackageNotFoundError:
+        return None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def repair_command(want: str, recorded: Optional[str], *, dist_name: Optional[str] = None) -> list:
     """THE command that puts `invisible-core=={want}` in place: the one the
     message tells the user to run and the one the repair runs. They were two
     constructions until 49.45.0, and they differed.
+
+    Known fork consumers use the fork's fixed Git tag. Author and index
+    consumers keep the index requirement, including when a fork core is present.
 
     It replaces the CORE and nothing else. The repair used to run
     `--force-reinstall`, which reinstalls every dependency too, and the repair
@@ -681,9 +710,17 @@ def repair_command(want: str, recorded: Optional[str]) -> list:
     the force-reinstall did: the repair reports it, rolls nothing forward, and
     the message hands over this same command, which works from a new process.
     """
+    fork = _fork_distribution(dist_name) if dist_name else None
+    if fork is None:
+        fork = _fork_distribution(CORE_NAME)
+    requirement = f"{CORE_NAME}=={want}"
+    if fork:
+        if not re.fullmatch(r"[0-9][A-Za-z0-9.+-]*", want):
+            raise ValueError("a fork core repair requires a safe exact version")
+        requirement = f"{CORE_NAME} @ git+https://github.com/idawnlight/invisible_core.git@v{want}"
     if recorded == want:
-        return install(CORE_NAME, "--force-reinstall", "--no-deps", f"{CORE_NAME}=={want}")
-    return install(CORE_NAME, f"{CORE_NAME}=={want}")
+        return install(CORE_NAME, "--force-reinstall", "--no-deps", requirement)
+    return install(CORE_NAME, requirement)
 
 
 def pin_report(dist_name: str) -> dict:
@@ -885,7 +922,7 @@ def repair_core(
     if not want:
         return RepairResult(False, False, "nothing is declared to install", "", None, None)
 
-    cmd = repair_command(want, recorded_core_version())
+    cmd = repair_command(want, recorded_core_version(), dist_name=dist_name)
     shown = format_command(cmd)
 
     if not autofix_enabled():

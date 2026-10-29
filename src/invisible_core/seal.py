@@ -71,6 +71,7 @@ STAMP_NAME = ".invisible-seal.json"
 # invisible_core seal` defaults to "local", and a user naming their own build is
 # expected. That is a supported state, not an error - see Seal.contract_n.
 RELEASE_TAG_RE = re.compile(r"^firefox-(\d+)$")
+VERSIONED_RELEASE_TAG_RE = re.compile(r"^firefox-\d+\.\d+(?:\.\d+)?-r[1-9]\d*$")
 
 # The one remedy line printed whenever this package itself is the thing that has
 # to move. It must stay an INDEX install: `git+https://...` installs a PEP 508
@@ -228,12 +229,13 @@ class Seal:
 
     @property
     def is_release(self) -> bool:
-        """True when this seal names a published firefox-N release.
+        """True when this seal names a legacy or versioned engine release.
 
         The tag test, not the assets test: a seal built by --from-tree against a
         release checkout can be tagged firefox-N and still carry no assets.
         """
-        return bool(RELEASE_TAG_RE.match(self.tag))
+        return bool(RELEASE_TAG_RE.fullmatch(self.tag) or
+                    VERSIONED_RELEASE_TAG_RE.fullmatch(self.tag))
 
     @property
     def is_local(self) -> bool:
@@ -434,6 +436,8 @@ class EngineIdentity:
     # "omni.ja" (win/macOS packaged tree), "loose" (the Linux archives, which
     # ship modules/juggler/ unpacked and no omni.ja), or "none".
     juggler_layout: str = "none"
+    source_commit: Optional[str] = None
+    platform_source_commit: Optional[str] = None
 
 
 def resource_root(entry: "str | os.PathLike[str]") -> Path:
@@ -546,12 +550,19 @@ def read_engine_identity(entry: "str | os.PathLike[str]") -> EngineIdentity:
             f"no executable at {p}\n"
             f"  (nothing to verify: the path does not exist or is not readable: {e})",
             problems=(f"no executable at {p} ({e})",), entry=p)
-    key = (str(p), st.st_mtime_ns, st.st_size)
+    root = resource_root(p)
+    ini_stats = []
+    for name in ("application.ini", "platform.ini"):
+        try:
+            ini_stat = (root / name).stat()
+            ini_stats.append((ini_stat.st_mtime_ns, ini_stat.st_size))
+        except OSError:
+            ini_stats.append(None)
+    key = (str(p), st.st_mtime_ns, st.st_size, *ini_stats)
     hit = _IDENT_CACHE.get(key)
     if hit is not None:
         return hit
 
-    root = resource_root(p)
     notes = []
     app = _parse_ini(root / "application.ini")
     plat = _parse_ini(root / "platform.ini")
@@ -571,6 +582,8 @@ def read_engine_identity(entry: "str | os.PathLike[str]") -> EngineIdentity:
         platform_build_id=plat.get("Build", {}).get("BuildID"),
         juggler_present=juggler_present, marked_entries=marked,
         notes=tuple(notes), juggler_layout=layout,
+        source_commit=app.get("App", {}).get("SourceStamp"),
+        platform_source_commit=plat.get("Build", {}).get("SourceStamp"),
     )
     _IDENT_CACHE[key] = ident
     return ident
@@ -607,6 +620,11 @@ def engine_problems(ident: EngineIdentity, seal: Seal,
     probs = list(ident.notes)
     if ident.version != seal.upstream_version:
         probs.append(f"application.ini Version {ident.version!r} != {seal.upstream_version!r}")
+    if seal.source_commit:
+        for label, source in (("application.ini", ident.source_commit),
+                              ("platform.ini", ident.platform_source_commit)):
+            if source != seal.source_commit:
+                probs.append(f"{label} SourceStamp {source!r} != {seal.source_commit!r}")
     # One leg, one CI build, one BuildID: the tree is checked against the leg it
     # IS, not against a seal-wide scalar (which matched one platform and refused
     # every other).

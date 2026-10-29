@@ -481,8 +481,8 @@ def _extract(archive: Path, dst: Path) -> None:
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as zf:
             zf.extractall(dst)
-    elif archive.name.endswith(".tar.gz") or archive.suffix in {".tgz", ".gz"}:
-        with tarfile.open(archive, "r:gz") as tf:
+    elif archive.name.endswith((".tar.gz", ".tar.xz")) or archive.suffix in {".tgz", ".gz"}:
+        with tarfile.open(archive, "r:*") as tf:
             tf.extractall(dst)
     else:
         raise RuntimeError(f"unknown archive format: {archive}")

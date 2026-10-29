@@ -30,6 +30,33 @@ def test_the_corpus_is_judged_as_it_says():
         assert install_job.leak_problems(text) == [], name
 
 
+GITHUB_TRIGGERS = '''on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+'''
+
+
+def test_github_release_triggers_need_no_pypi_ledger_or_wait():
+    assert install_job.problems(GITHUB_TRIGGERS, "github") == []
+    assert install_job.problems(GITHUB_TRIGGERS)
+
+
+@pytest.mark.parametrize("before,after", [
+    ('tags: ["v*"]', 'branches: ["main"]'),
+    ("  workflow_dispatch:\n", ""),
+    ("  schedule:\n", "  unrelated:\n"),
+])
+def test_missing_github_install_triggers_are_reported(before, after):
+    assert install_job.problems(GITHUB_TRIGGERS.replace(before, after), "github")
+
+
+def test_a_release_event_cannot_replace_the_github_tag_trigger():
+    assert install_job.problems(GITHUB_TRIGGERS + "  release:\n    types: [published]\n", "github")
+
+
 def test_this_repository_runs_its_install_job_on_the_ledger_pull_request():
     """The trigger, the wait, and every test file it runs covering `LEAKS`."""
     assert install_job.judge(_ROOT) == []

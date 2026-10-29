@@ -45,10 +45,10 @@ FOREIGN_BUILD = "20260611193205"
 OLD_VERSION = "150.0.1"
 OLD_BUILD = "20260624073725"
 
-APP_INI = ("[App]\nVendor=Mozilla\nName=Firefox\nVersion={v}\nBuildID={b}\n"
+APP_INI = ("[App]\nVendor=Mozilla\nName=Firefox\nVersion={v}\nBuildID={b}\nSourceStamp=0123456789abcdef\n"
            "ID={{ec8030f7-c20a-464f-9b0e-13a3a9e97384}}\n\n"
            "[Gecko]\nMinVersion={v}\nMaxVersion={v}\n")
-PLAT_INI = "[Build]\nBuildID={b}\nMilestone={v}\nSourceStamp=deadbeef\n"
+PLAT_INI = "[Build]\nBuildID={b}\nMilestone={v}\nSourceStamp=0123456789abcdef\n"
 
 
 def entry_rel() -> str:
@@ -100,6 +100,32 @@ def write_seal(path: Path, *, tag: str = "firefox-18", version: str = SEALED_VER
 def sealed(tmp_path):
     """The seal under test: firefox-18, Firefox 151.0, the sealed BuildID."""
     return load_seal(write_seal(tmp_path / "firefox-18.seal.json"))
+
+
+@pytest.mark.parametrize("filename", ["application.ini", "platform.ini"])
+@pytest.mark.parametrize("source", [None, "another-source-commit"])
+def test_source_stamp_is_checked_even_after_the_tree_was_cached(tmp_path, sealed, filename, source):
+    entry = build_tree(tmp_path / "engine")
+    assert verify_engine(entry, sealed, source="first read") == entry
+    path = resources_of(tmp_path / "engine") / filename
+    text = path.read_text()
+    replacement = "" if source is None else f"SourceStamp={source}\n"
+    path.write_text(text.replace("SourceStamp=0123456789abcdef\n", replacement))
+
+    with pytest.raises(EngineMismatch, match=f"{filename} SourceStamp"):
+        verify_engine(entry, sealed, source="cache read")
+
+
+def test_a_historical_seal_without_source_keeps_its_build_id_contract(tmp_path):
+    path = write_seal(tmp_path / "historical.json")
+    data = json.loads(path.read_text())
+    data.pop("source_commit")
+    path.write_text(json.dumps(data))
+    entry = build_tree(tmp_path / "engine")
+    for filename in ("application.ini", "platform.ini"):
+        ini = resources_of(tmp_path / "engine") / filename
+        ini.write_text(ini.read_text().replace("SourceStamp=0123456789abcdef\n", ""))
+    assert verify_engine(entry, load_seal(path), source="historical seal") == entry
 
 
 # --------------------------------------------------------------- the baseline

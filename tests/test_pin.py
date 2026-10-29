@@ -71,9 +71,8 @@ def make_core(
 ) -> Path:
     """A real-enough invisible_core under `site`.
 
-    pin.py and _version.py are COPIES OF THE SHIPPED FILES, so the derivation
-    under test is the real one: seal.json's tag number, plus CORE_REVISION out of
-    _version.py, is what installed_core_version() has to report.
+    pin.py and _version.py are copies of the shipped files. The fixture writes
+    an explicit synthetic package version into that real version module.
 
     init_version plants a package-level __version__ (which in the real package is
     importlib.metadata.version, i.e. the installer's record). It exists so one
@@ -109,7 +108,8 @@ def make_core(
     shutil.copy2(REAL_PKG / "environment.py", pkg / "environment.py")
     if with_version:
         text = (REAL_PKG / "_version.py").read_text(encoding="utf-8")
-        text = re.sub(r"(?m)^CORE_REVISION\s*=\s*\d+", f"CORE_REVISION = {revision}", text)
+        version = f"{tag.removeprefix('firefox-')}.{revision}.0"
+        text = re.sub(r'(?m)^__version__\s*=.*$', f'__version__ = "{version}"', text)
         (pkg / "_version.py").write_text(text, encoding="utf-8")
         (pkg / "seal.json").write_text(json.dumps({"tag": tag}), encoding="utf-8")
     (pkg / "seal.py").write_text(
@@ -588,10 +588,13 @@ def test_the_real_installation_reports_a_pin_that_holds():
 # them is proved by the layouts above, which is the half the old suite skipped.
 
 def verdict(**kw):
+    from unittest.mock import patch
+
     base = dict(dist_name="invisible-playwright", want="18.0.0", have="19.0.0",
                 recorded="19.0.0", dist_version="0.3.5")
     base.update(kw)
-    return _pin.pin_problem(**base)
+    with patch.object(_pin, "_fork_distribution", return_value=False):
+        return _pin.pin_problem(**base)
 
 
 def test_a_plain_mismatch_names_both_versions_and_the_remedy():
@@ -622,13 +625,11 @@ def test_a_stale_install_record_is_told_to_force_reinstall():
 
 
 def test_the_mismatch_message_names_the_file_the_version_comes_from():
-    """It used to blame invisible_core/seal.json alone. The version is
-    <seal tag>.<CORE_REVISION>.0 and CORE_REVISION is a literal in _version.py,
-    so the user has to be told which file to open."""
+    """The mismatch points at the explicit Python package version declaration."""
     for msg in (verdict(), verdict(recorded="18.0.0"),
                 verdict(editable_path=r"C:\some\where")):
         assert "_version.py" in msg, msg
-        assert "CORE_REVISION" in msg, msg
+        assert "__version__" in msg, msg
 
 
 def test_an_undeterminable_version_is_rendered_honestly_not_as_a_pass():
@@ -933,9 +934,9 @@ def run_autofix(
     """Drive enforce_core_pin() in a child with a recording installer.
 
     ok           what the fake install reports back.
-    new_tag      when set, the fake install REWRITES the stub's seal.json, which
-                 is the only way the derived version can move. Leaving it None
-                 with ok=True is the "pip said 0 and changed nothing" case.
+    new_tag      selects the synthetic package version the fake install writes
+                 to _version.py. Leaving it None with ok=True is the
+                 "pip said 0 and changed nothing" case.
     wipe_direct_url  a path the fake install deletes, to reproduce pip replacing
                  the .dist-info an editable core's path was read from.
     """
@@ -957,8 +958,12 @@ def run_autofix(
                 raise OSError("pip could not be started")
             if execute and {ok!r}:
                 if {new_tag!r}:
-                    (pathlib.Path({str(site)!r}) / "invisible_core" / "seal.json"
-                     ).write_text(json.dumps({{"tag": {new_tag!r}}}), encoding="utf-8")
+                    version_path = pathlib.Path({str(site)!r}) / "invisible_core" / "_version.py"
+                    version = {new_tag!r}.removeprefix("firefox-") + ".0.0"
+                    import re
+                    version_path.write_text(re.sub(r'(?m)^__version__\\s*=.*$',
+                        '__version__ = ' + repr(version), version_path.read_text()), encoding="utf-8")
+                    __import__('shutil').rmtree(version_path.parent / '__pycache__', ignore_errors=True)
                 if {wipe_direct_url!r}:
                     pathlib.Path({wipe_direct_url!r}).unlink()
             return _pin.InstallOutcome(bool(execute and {ok!r}), "recorded", "recorded")
@@ -1221,10 +1226,14 @@ def test_the_kill_switch_turns_the_repair_back_into_a_report(tmp_path):
     assert "switched off" in out["raised"][0], out["raised"][0]
 
 
-def test_a_pin_that_holds_installs_nothing(tmp_path):
+@pytest.mark.parametrize("direct_url", [None, {
+    "url": "https://github.com/idawnlight/invisible_core.git",
+    "vcs_info": {"vcs": "git", "commit_id": "a" * 40, "requested_revision": "v18.0.0"},
+}])
+def test_a_pin_that_holds_installs_nothing(tmp_path, direct_url):
     """The floor, not a wall. This is also what stops the repair from firing on
     every import of a healthy environment."""
-    site = mismatched_site(tmp_path, want="18.0.0")
+    site = mismatched_site(tmp_path, want="18.0.0", direct_url=direct_url)
     out = run_autofix(site)
 
     assert out["raised"] == [None], out["raised"]
@@ -1475,3 +1484,88 @@ def test_an_installed_consumer_declares_what_its_metadata_says(monkeypatch):
     monkeypatch.setattr(_pin, "_distribution", lambda name: _Record(None))
     monkeypatch.setattr(_pin, "_requires", lambda name: ["invisible-core==42.39.0"])
     assert _pin.pin_declaration("some-consumer").version == "42.39.0"
+
+
+def recovery_record(site, name, *, repository=None, git_url=None):
+    from importlib.metadata import Distribution
+
+    direct = {"url": git_url, "vcs_info": {"vcs": "git", "commit_id": "a" * 40}} if git_url else None
+    path = make_distinfo(site, name, "159.49.1", direct_url=direct)
+    if repository:
+        with (path / "METADATA").open("a") as metadata:
+            metadata.write(f"Project-URL: Repository, {repository}\n")
+    return Distribution.at(path)
+
+
+@pytest.mark.parametrize("recorded", ["159.49.0", "159.49.1"])
+def test_fork_core_repair_uses_the_expected_git_tag(monkeypatch, tmp_path, recorded):
+    record = recovery_record(tmp_path, "invisible-core",
+                             git_url="https://github.com/idawnlight/invisible_core.git")
+    monkeypatch.setattr(_pin, "_distribution", lambda name: record)
+    command = _pin.repair_command("159.49.1", recorded)
+    assert command[-1] == "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v159.49.1"
+    assert ("--force-reinstall" in command) == (recorded == "159.49.1")
+    assert ("--no-deps" in command) == (recorded == "159.49.1")
+
+
+def test_fork_consumer_selects_its_core_source_without_reusing_an_author_core(monkeypatch, tmp_path):
+    records = {
+        "invisible-core": recovery_record(tmp_path, "invisible-core",
+                                           git_url="https://github.com/feder-cr/invisible_core.git"),
+        "invisible-playwright": recovery_record(tmp_path, "invisible-playwright",
+                                                 git_url="https://github.com/idawnlight/invisible_playwright.git"),
+    }
+    monkeypatch.setattr(_pin, "_distribution", records.__getitem__)
+    command = _pin.repair_command("159.49.1", "53.48.0", dist_name="invisible-playwright")
+    assert command[-1].endswith("idawnlight/invisible_core.git@v159.49.1")
+
+
+def test_an_author_consumer_keeps_its_index_source_with_a_fork_core(monkeypatch, tmp_path):
+    records = {
+        "invisible-core": recovery_record(tmp_path, "invisible-core",
+                                           git_url="https://github.com/idawnlight/invisible_core.git"),
+        "invisible-playwright": recovery_record(tmp_path, "invisible-playwright"),
+    }
+    monkeypatch.setattr(_pin, "_distribution", records.__getitem__)
+    command = _pin.repair_command("53.48.0", "159.49.1", dist_name="invisible-playwright")
+    assert command[-1] == "invisible-core==53.48.0"
+
+
+def test_a_github_release_wheel_can_identify_its_fork_from_repository_metadata(monkeypatch, tmp_path):
+    record = recovery_record(tmp_path, "invisible-core",
+                             repository="https://github.com/idawnlight/invisible_core")
+    monkeypatch.setattr(_pin, "_distribution", lambda name: record)
+    assert _pin.repair_command("159.49.1", None)[-1].endswith("invisible_core.git@v159.49.1")
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/feder-cr/invisible_core.git",
+    "https://github.com/idawnlight/invisible_core.git@untrusted",
+    "https://github.com/idawnlight/invisible_core.git.evil.test",
+    "https://evil.test/idawnlight/invisible_core.git",
+])
+def test_recovery_does_not_copy_an_arbitrary_direct_url(monkeypatch, tmp_path, url):
+    record = recovery_record(tmp_path, "invisible-core", git_url=url)
+    monkeypatch.setattr(_pin, "_distribution", lambda name: record)
+    assert _pin.repair_command("159.49.1", None)[-1] == "invisible-core==159.49.1"
+
+
+def test_fork_recovery_rejects_an_unsafe_version_before_forming_a_requirement(monkeypatch, tmp_path):
+    record = recovery_record(tmp_path, "invisible-core",
+                             git_url="https://github.com/idawnlight/invisible_core.git")
+    monkeypatch.setattr(_pin, "_distribution", lambda name: record)
+    with pytest.raises(ValueError, match="safe exact version"):
+        _pin.repair_command("159.49.1; echo unexpected", None)
+
+
+def test_a_fork_consumer_repair_executes_its_git_requirement_and_continues(tmp_path):
+    site = mismatched_site(tmp_path)
+    make_distinfo(site, "invisible-playwright", "0.43.1", ("invisible-core==19.0.0",),
+                  direct_url={"url": "https://github.com/idawnlight/invisible_playwright.git",
+                              "vcs_info": {"vcs": "git", "commit_id": "a" * 40}})
+    out = run_autofix(site, dist="invisible-playwright", new_tag="firefox-19")
+    assert out["raised"] == [None], out
+    assert out["after"] == "19.0.0"
+    assert len(out["calls"]) == 1 and out["calls"][0]["execute"] is True
+    assert out["calls"][0]["cmd"][-1] == (
+        "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v19.0.0")

@@ -158,9 +158,9 @@ EMPTY_LEDGER = '{"schema": 1, "released": []}'
 def set_core_revision(root: Path, value: int) -> None:
     p = root / "src" / "invisible_core" / "_version.py"
     src = p.read_text(encoding="utf-8")
-    out = "\n".join(f"CORE_REVISION = {value}" if line.startswith("CORE_REVISION")
+    out = "\n".join(f'__version__ = "18.{value}.0"' if line.startswith("__version__ =")
                     else line for line in src.splitlines()) + "\n"
-    assert f"CORE_REVISION = {value}" in out
+    assert f'__version__ = "18.{value}.0"' in out
     p.write_text(out, encoding="utf-8")
 
 
@@ -302,10 +302,10 @@ def test_kb1_seal_changed_without_the_tag_moving_is_refused(core):
     assert "RELEASE REFUSED" in text
     assert "the content changed but the version did not" in text
     assert "invisible_core/seal.json" in text
-    assert "CORE_REVISION" in text and "_version.py" in text
-    assert "18.0.0 -> 18.1.0" in text, "the remedy must name the next version"
+    assert "__version__" in text and "_version.py" in text
+    assert "18.0.0 -> 18.0.1" in text, "the remedy must name the next version"
     # The seal tag did not move, so the other legal remedy must be offered too.
-    assert "roll a new seal" in text
+    assert "independent of the engine tag" in text
 
 
 def test_kb2_a_python_docstring_change_is_refused(core):
@@ -317,7 +317,7 @@ def test_kb2_a_python_docstring_change_is_refused(core):
     text = out_of(r)
     assert r.returncode == 1, text
     assert "changed  wheel: invisible_core/prefs.py" in text
-    assert "bump CORE_REVISION" in text
+    assert "Bump __version__" in text
 
 
 def test_kb3_a_new_dependency_is_refused_because_metadata_is_content(core):
@@ -377,7 +377,8 @@ def test_kb6_a_direct_url_dependency_is_refused(core):
 def test_kb7_a_version_that_goes_backwards_is_refused(core):
     """CORE_REVISION must never be reset and a tag must never go down: pip
     compares with != , not <, and the index refuses a reused number outright."""
-    edit_seal(core, tag="firefox-17")
+    path = core / "src/invisible_core/_version.py"
+    path.write_text(path.read_text().replace('__version__ = "18.0.0"', '__version__ = "17.0.0"'))
 
     r = run_gate(core)
     text = out_of(r)
@@ -398,18 +399,16 @@ def test_an_unchanged_tree_at_a_published_version_is_refused(core):
 
 # ------------------------------------------------------------- known good
 
-def test_ok1_moving_only_the_seal_tag_is_allowed(core):
-    """The version is a projection of seal['tag'], so a seal edit that moves the
-    tag moves the version for free. This is the ONE seal change that is not an
-    un-versioned content change, and the gate must not confuse it with KB1."""
+def test_a_seal_tag_change_also_needs_an_explicit_package_version(core):
+    """An engine-only bundle change still needs an explicit Python release."""
     edit_seal(core, tag="firefox-19")
 
     r = run_gate(core)
     text = out_of(r)
-    assert r.returncode == 0, text
-    assert re.search(r"invisible[-_]core 19\.0\.0", text), text[:200]
-    assert "HAS NEVER BEEN PUBLISHED" in text
-    assert "PUBLISH ALLOWED" in text
+    assert r.returncode == 1, text
+    assert "the content changed but the version did not" in text
+    assert "invisible_core/seal.json" in text
+    assert "Bump __version__" in text
 
 
 def test_ok2_a_code_change_with_a_core_revision_bump_is_allowed(core):
@@ -1204,6 +1203,7 @@ def test_publish_refuses_a_core_sealed_to_no_downloadable_binary(core):
     upload, because the guard sits before the dry-run print."""
     edit_seal(core, tag="firefox-51", assets={}, build_id="20261020000535",
               source_commit="17140065a1b0477fabecf16f921120176803aa8b")
+    set_core_revision(core, 1)
     r = run_gate(core, "publish", "--dry-run")
     text = out_of(r)
     assert r.returncode == 1, text

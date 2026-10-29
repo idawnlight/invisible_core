@@ -307,6 +307,13 @@ def test_the_publish_workflow_stages_the_changelog_it_realigned():
         pytest.skip("not a source checkout - .github/ is not shipped")
     text = "\n".join(line for line in wf.read_text(encoding="utf-8").splitlines()
                      if not line.lstrip().startswith("#"))
+    import tomllib
+    config = tomllib.loads((wf.parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
+    if config["tool"]["invisible"]["hooks"].get("release_backend", "pypi") == "github":
+        assert "invisible_core.github_release" in text
+        assert "gh release create" in text and "--verify-tag" in text
+        assert "git add PUBLISHED.json" not in text
+        return
     ledger_step = text[text.index("git add PUBLISHED.json"):]
     ledger_step = ledger_step[:ledger_step.index("git commit -m")]
     assert "git add CHANGELOG.md" in ledger_step, (

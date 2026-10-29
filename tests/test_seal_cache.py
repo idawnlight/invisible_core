@@ -52,8 +52,8 @@ OTHER_BUILD = "20260611193205"
 OLD_VERSION = "150.0.1"
 OLD_BUILD = "20260624073725"
 
-APP_INI = "[App]\nVendor=Mozilla\nName=Firefox\nVersion={v}\nBuildID={b}\n\n[Gecko]\nMinVersion={v}\nMaxVersion={v}\n"
-PLAT_INI = "[Build]\nBuildID={b}\nMilestone={v}\n"
+APP_INI = "[App]\nVendor=Mozilla\nName=Firefox\nVersion={v}\nBuildID={b}\nSourceStamp=0123456789abcdef\n\n[Gecko]\nMinVersion={v}\nMaxVersion={v}\n"
+PLAT_INI = "[Build]\nBuildID={b}\nMilestone={v}\nSourceStamp=0123456789abcdef\n"
 
 
 class NetworkTouched(RuntimeError):

@@ -1,17 +1,6 @@
-"""Package version. Derived from the seal so it CANNOT stay behind a binary
-release: bumping the tag bumps the version, which is the exact condition pip's
-resolver tests before it decides to skip a git dependency.
+"""Python package version, independent of the bundled engine release."""
 
-CORE_REVISION is the ONLY hand-edited number in this package. Bump it by one
-for a core-only release (a pure-Python fix against the same engine). Never
-reset it: pip compares with != , not <.
-"""
-import json
-import pathlib
+__version__ = "159.49.1"
 
-CORE_REVISION = 49
-
-_seal = json.loads(
-    pathlib.Path(__file__).with_name("seal.json").read_text(encoding="utf-8")
-)
-__version__ = f"{int(_seal['tag'].split('-')[1])}.{CORE_REVISION}.0"
+# Retained for callers importing the historical constant.
+CORE_REVISION = int(__version__.split(".")[1])

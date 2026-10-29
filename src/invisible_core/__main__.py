@@ -243,7 +243,7 @@ def _package_section(facts_of=None
         origin = f"  [{core.direct_url.get('url', 'local')}]"
     elif core.present:
         origin = "  [index]"
-    lines.append(f"  {CORE_DIST:<21}{DERIVED_CORE_VERSION:<9}(derived from seal.json){origin}")
+    lines.append(f"  {CORE_DIST:<21}{DERIVED_CORE_VERSION:<9}(from _version.py){origin}")
     if not core.present:
         lines.append(f"  {'':<21}no install record for this distribution "
                      f"(running from a source checkout)")

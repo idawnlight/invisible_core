@@ -4,12 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "invisible_core"
-# Derived from the seal (see src/invisible_core/_version.py): the tag number of
-# the engine this core is sealed to, so a binary bump always moves the version
-# string pip compares before it decides whether to reinstall. A core-only fix
-# against the same engine moves CORE_REVISION instead, by hand - and
-# scripts/version_gate.py refuses to publish content that changed under a
-# version string that did not.
+# The Python API version is declared in src/invisible_core/_version.py.
+# The bundled seal independently selects the default engine release.
 dynamic = ["version"]
 description = "Pure config for a stealth Firefox profile: seed -> fingerprint -> prefs, engine download, proxy, geo, and the Juggler client the wrappers drive it with. Zero Playwright."
 readme = "README.md"
@@ -74,9 +70,9 @@ dev = ["pytest>=7", "pytest-mock>=3", "responses>=0.24", "build>=1", "hatchling"
 invisible-core = "invisible_core.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/feder-cr/invisible_core"
-Repository = "https://github.com/feder-cr/invisible_core"
-Issues = "https://github.com/feder-cr/invisible_core/issues"
+Homepage = "https://github.com/idawnlight/invisible_core"
+Repository = "https://github.com/idawnlight/invisible_core"
+Issues = "https://github.com/idawnlight/invisible_core/issues"
 
 [tool.pytest.ini_options]
 markers = [
@@ -158,6 +154,7 @@ include = ["src/invisible_core", "tests", "README.md", "LICENSE", "LICENSE-APACH
 pytest = true
 pin = false
 release_tags = ["v", "release-"]
+release_backend = "github"
 
 # What this repository declares about ITSELF to the shared language gate
 # (`python -m invisible_core.english`). `injected.js` came with the Juggler

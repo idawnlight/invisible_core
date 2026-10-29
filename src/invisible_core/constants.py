@@ -151,7 +151,7 @@ def release_url_template(repository: str) -> str:
 
 
 RELEASE_URL_TEMPLATE = release_url_template(os.environ.get(
-    environment.ENGINE_REPOSITORY, "feder-cr/firefox_antidetect_patch"))
+    environment.ENGINE_REPOSITORY, "idawnlight/firefox_antidetect_patch"))
 
 # ─────────────────────────────────────────────────────────────────────────
 #  GeoIP database (timezone="auto" → resolve IANA zone from proxy egress IP)

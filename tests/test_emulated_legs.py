@@ -7,25 +7,31 @@ the declaration does and does not do, on every runner.
 from __future__ import annotations
 
 import pytest
+from dataclasses import replace
 
-from invisible_core.seal import EMULATED_LEGS, active_seal
+from invisible_core.seal import Asset, EMULATED_LEGS, active_seal
 
 
-def test_a_windows_arm64_host_gets_the_x86_64_asset():
+@pytest.fixture
+def seal_with_supported_legs():
+    assets = {}
+    for platform, arch in (("win32", "x86_64"), ("linux", "x86_64"), ("linux", "arm64")):
+        name = f"{platform}-{arch}.zip"
+        assets[name] = Asset(name, platform, arch, "0" * 64, 1, "firefox", "", "20261029033851")
+    return replace(active_seal(), assets=assets)
+
+
+def test_a_windows_arm64_host_gets_the_x86_64_asset(seal_with_supported_legs):
     """Refused with NotImplementedError until 2026-09-25, with no remedy."""
-    seal = active_seal()
-    if seal.is_local:
-        pytest.skip("packaged seal is a LOCAL seal with no assets")
+    seal = seal_with_supported_legs
     asset = seal.asset_for("win32", "ARM64")
     assert (asset.platform, asset.arch) == ("win32", "x86_64"), asset
 
 
-def test_a_native_asset_wins_over_the_emulated_one():
+def test_a_native_asset_wins_over_the_emulated_one(seal_with_supported_legs):
     """Linux ARM64 has its own asset and must keep getting it: the declaration
     is for hosts WITHOUT one, not a preference for x86_64."""
-    seal = active_seal()
-    if seal.is_local:
-        pytest.skip("packaged seal is a LOCAL seal with no assets")
+    seal = seal_with_supported_legs
     asset = seal.asset_for("linux", "aarch64")
     assert (asset.platform, asset.arch) == ("linux", "arm64"), asset
 

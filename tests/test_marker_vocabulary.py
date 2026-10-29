@@ -31,7 +31,6 @@ installed copy has no siblings and no opinion about them.
 from __future__ import annotations
 
 import ast
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -768,6 +767,16 @@ def test_the_core_checks_daily_that_its_published_seals_still_resolve():
     if not path.is_file():
         pytest.skip("not the workbench")
     text = path.read_text(encoding="utf-8")
+    config = tomllib.loads((_repo("invisible_core") / "pyproject.toml").read_text(encoding="utf-8"))
+    if config["tool"]["invisible"]["hooks"].get("release_backend", "pypi") == "github":
+        from invisible_core import install_job
+        assert install_job.problems(text, "github") == []
+        assert "tests/test_github_install_e2e.py" in text
+        assert "pypi.org" not in text
+        assert "test_default_release_downloads_into_an_empty_cache" in text
+        assert "test_second_lookup_reuses_the_cache_without_network" in text
+        assert "passed != expected" in text
+        return
     # Whitespace-collapsed, because the phrases below are wrapped across source
     # lines inside the embedded script. The first version of this test searched
     # the raw text and failed on its own subject - the guard was there, split by
@@ -859,62 +868,36 @@ def test_every_python_a_repo_promises_is_actually_run():
         + "".join(chr(10) + "  " + p for p in problems))
 
 
-def test_every_published_package_uploads_without_a_stored_credential():
-    """Three packages were on PyPI when this was written; only one had a
-    publish workflow.
-
-    The other two were uploaded by hand from one machine with a long-lived PyPI
-    token on it. That token is a standing credential whose blast radius is the
-    whole project, and a hand-run twine has no gate in front of it - the ordering
-    rules live in somebody's memory rather than in a `needs:`.
-
-    All three moved to publish through the `pypi` GitHub Environment's OIDC
-    trust relationship, minted per run. This asserts the two properties that
-    make that true and that a well-meaning edit can undo: the upload job asks
-    for `id-token: write`, and NOTHING in the file reaches for a stored
-    password.
-
-    A token creeping back is not a syntax error and would work, which is exactly
-    why it needs a test rather than a review.
-
-    `invisible_firefox` was one of the three and its publish.yml is what this
-    was first measured against; it is not checked below any more, because its
-    checkout went with the repo on 2026-08-18. The PyPI package it left behind
-    (13 versions, unyanked) is a fact about the index, not about a workflow file
-    this test could still read - there is no tree here to read it from. The
-    other two are asserted below, over `_DEFAULT_SUITE_WORKFLOW`, which already
-    lists only the repos that still exist.
-    """
+def test_every_published_package_uses_its_declared_release_backend():
     import re
+    import yaml
 
-    forbidden = re.compile(
-        r"(password\s*:|PYPI_API_TOKEN|PYPI_TOKEN|TWINE_PASSWORD|secrets\.PYPI)")
-    problems = []
+    forbidden = re.compile(r"(password\s*:|PYPI_API_TOKEN|PYPI_TOKEN|TWINE_PASSWORD|secrets\.PYPI)")
     for repo in _DEFAULT_SUITE_WORKFLOW:
-        wf = _repo(repo) / ".github/workflows/publish.yml"
-        if not (_repo(repo)).is_dir():
+        root = _repo(repo)
+        if not root.is_dir():
             pytest.skip("not the workbench - the sibling repos are not here")
-        if not wf.is_file():
-            problems.append(repo + ": no .github/workflows/publish.yml, so it is "
-                                   "published by hand with a long-lived token")
-            continue
-        text = wf.read_text(encoding="utf-8")
-        if "id-token: write" not in text:
-            problems.append(repo + ": publish.yml never asks for id-token: write, "
-                                   "so it cannot be using trusted publishing")
-        if "environment: pypi" not in text:
-            problems.append(repo + ": the upload job names no `environment: pypi`, "
-                                   "which is where the trust relationship lives")
-        hit = forbidden.search(text)
-        if hit:
-            problems.append(
-                repo + ": publish.yml reaches for a stored credential ("
-                + hit.group(0) + "), which is the thing OIDC replaced")
-
-    assert not problems, (
-        "the publish path can be authenticated by something other than a"
-        " short-lived OIDC token:"
-        + "".join(chr(10) + "  " + p for p in problems))
+        workflow = root / ".github/workflows/publish.yml"
+        assert workflow.is_file(), f"{repo}: no publish workflow"
+        text = workflow.read_text(encoding="utf-8")
+        config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        backend = config["tool"]["invisible"]["hooks"].get("release_backend", "pypi")
+        assert not forbidden.search(text), f"{repo}: publish workflow uses a stored package credential"
+        if backend == "github":
+            jobs = yaml.safe_load(text)["jobs"]
+            upload = jobs["upload"]
+            needs = upload["needs"]
+            assert "gate" in ([needs] if isinstance(needs, str) else needs)
+            assert upload["permissions"]["contents"] == "write"
+            gate_steps = "\n".join(str(step.get("run", "")) for step in jobs["gate"]["steps"])
+            assert "invisible_core.github_release" in gate_steps and "--tag" in gate_steps
+            assert "--verify-index" not in text and "PUBLISHED.json" not in text
+            assert "secrets.GITHUB_TOKEN" in text and "gh release create" in text
+            assert "sha256sum --check SHA256SUMS" in text
+        else:
+            assert backend == "pypi"
+            assert "id-token: write" in text, f"{repo}: PyPI publishing needs OIDC"
+            assert "environment: pypi" in text, f"{repo}: missing PyPI environment"
 
 
 def test_no_workflow_reads_a_version_its_pyproject_does_not_have():

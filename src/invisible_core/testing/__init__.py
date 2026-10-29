@@ -170,7 +170,9 @@ def assert_pre_push_policy_is_wired(repo_root: Path,
 
     hooks.main(root=Path(repo_root), run=record, env=dict(off), python="PY",
                push_refs=f"x NEW {tag} 0000\n")
-    gate = [c for c in calls if "invisible_core.release" in c]
+    gate_module = ("invisible_core.github_release" if cfg["release_backend"] == "github"
+                   else "invisible_core.release")
+    gate = [c for c in calls if gate_module in c]
     assert gate, (
         f"pushing {tag} did not run the publish gate, so a release tag can be "
         f"pushed - and published - with no check at all")
@@ -178,11 +180,15 @@ def assert_pre_push_policy_is_wired(repo_root: Path,
         f"the gate ran against {gate[0]!r} rather than this project. One gate "
         f"shared by every project that pins it: pointed at the wrong one it "
         f"passes every time.")
+    if cfg["release_backend"] == "github":
+        assert gate[0][gate[0].index("--tag") + 1] == tag.removeprefix("refs/tags/")
+        assert "--verify-index" not in gate[0]
 
     calls.clear()
     hooks.main(root=Path(repo_root), run=record, env=dict(off), python="PY",
                push_refs="refs/heads/main NEW refs/heads/main OLD\n")
-    assert not [c for c in calls if "invisible_core.release" in c], (
+    assert not [c for c in calls if any(module in c for module in
+                ("invisible_core.release", "invisible_core.github_release"))], (
         "an ordinary branch push runs the publish gate, which builds the "
         "project twice; that is the cost that gets a hook deleted")
 

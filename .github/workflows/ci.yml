@@ -9,6 +9,31 @@ permissions:
   contents: read
 
 jobs:
+  release-support:
+    runs-on: ubuntu-latest
+    outputs:
+      windows: ${{ steps.seal.outputs.windows }}
+      backend: ${{ steps.seal.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read the supported release legs
+        id: seal
+        run: |
+          python - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import json, tomllib
+          seal = json.load(open("src/invisible_core/seal.json", encoding="utf-8"))
+          legs = {(asset["platform"], asset["arch"]) for asset in seal["assets"].values()}
+          config = tomllib.load(open("pyproject.toml", "rb"))
+          backend = config["tool"]["invisible"]["hooks"].get("release_backend", "pypi")
+          if backend not in {"github", "pypi"}:
+              raise SystemExit(f"unknown release backend {backend}")
+          print("windows=" + str(("win32", "x86_64") in legs).lower())
+          print("backend=" + backend)
+          PYTHON
+
   tests:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -98,6 +123,8 @@ jobs:
   # cannot fail is indistinguishable from one that passes. windows-2025 is
   # build 26100, the one the report came from.
   msix-host:
+    needs: release-support
+    if: needs.release-support.outputs.windows == 'true'
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
@@ -146,6 +173,8 @@ jobs:
   # repairs itself. uv comes from its own installer, the way the README's
   # reader gets it.
   repair-through-the-installer:
+    needs: release-support
+    if: needs.release-support.outputs.backend == 'pypi'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -201,6 +230,8 @@ jobs:
   # from an ARM64 interpreter and makes it start and render a page, and exits
   # 2 (BENCH_NOT_LIVE) if the interpreter is not ARM64 after all.
   arm64-host:
+    needs: release-support
+    if: needs.release-support.outputs.windows == 'true'
     runs-on: windows-11-arm
     timeout-minutes: 30
     steps:
@@ -270,7 +301,7 @@ jobs:
         run: |
           git init -q engine
           cd engine
-          git remote add origin https://github.com/feder-cr/firefox_antidetect_patch
+          git remote add origin https://github.com/idawnlight/firefox_antidetect_patch
           git sparse-checkout set --no-cone /scripts/ /python/mozbuild/
           git fetch -q --depth 1 --filter=blob:none origin "${{ steps.seal.outputs.source }}"
           git checkout -q FETCH_HEAD
@@ -341,7 +372,7 @@ jobs:
           PY
 
   gate:
-    needs: [tests, msix-host, arm64-host, branding-is-retail, repair-through-the-installer,
+    needs: [release-support, tests, msix-host, arm64-host, branding-is-retail, repair-through-the-installer,
             default-selection-stays-inside]
     if: always()
     runs-on: ubuntu-latest
@@ -355,8 +386,18 @@ jobs:
           echo "repair-through-the-installer: ${{ needs.repair-through-the-installer.result }}"
           echo "default-selection-stays-inside: ${{ needs.default-selection-stays-inside.result }}"
           test "${{ needs.tests.result }}" = "success"
-          test "${{ needs.msix-host.result }}" = "success"
-          test "${{ needs.arm64-host.result }}" = "success"
+          test "${{ needs.release-support.result }}" = "success"
+          if [ "${{ needs.release-support.outputs.windows }}" = "true" ]; then
+            test "${{ needs.msix-host.result }}" = "success"
+            test "${{ needs.arm64-host.result }}" = "success"
+          else
+            test "${{ needs.msix-host.result }}" = "skipped"
+            test "${{ needs.arm64-host.result }}" = "skipped"
+          fi
           test "${{ needs.branding-is-retail.result }}" = "success"
-          test "${{ needs.repair-through-the-installer.result }}" = "success"
+          if [ "${{ needs.release-support.outputs.backend }}" = "pypi" ]; then
+            test "${{ needs.repair-through-the-installer.result }}" = "success"
+          else
+            test "${{ needs.repair-through-the-installer.result }}" = "skipped"
+          fi
           test "${{ needs.default-selection-stays-inside.result }}" = "success"

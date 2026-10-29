@@ -190,6 +190,28 @@ def test_a_bare_string_release_tag_is_accepted_as_one_prefix(tmp_path):
     assert cfg["release_tags"] == ["rel"]
 
 
+def test_release_backend_defaults_to_pypi_for_existing_repositories(tmp_path):
+    assert hooks.hook_config(make_repo(tmp_path))["release_backend"] == "pypi"
+
+
+def test_an_unknown_release_backend_is_rejected(tmp_path):
+    root = make_repo(tmp_path, block='release_backend="unknown"')
+    with pytest.raises(hooks.HookConfigError, match="release_backend"):
+        hooks.hook_config(root)
+
+
+@pytest.mark.parametrize("returncode", [0, 1, 2, 5])
+def test_github_tag_gate_builds_the_exact_tag_without_the_index(tmp_path, returncode):
+    root = make_repo(tmp_path, block='pytest=false\npin=false\nrelease_backend="github"')
+    code, run = run_policy(root, refs="x NEW refs/tags/v1.2.3 0000\n",
+                           run=FakeRun({"invisible_core.github_release": returncode}))
+    assert (code == 0) is (returncode == 0)
+    call = run.call_for("invisible_core.github_release")
+    assert call[call.index("--tag") + 1] == "v1.2.3"
+    assert "--outdir" in call and "--verify-index" not in call
+    assert not run.ran("invisible_core.release")
+
+
 @pytest.mark.parametrize("repo", _SIBLINGS)
 def test_every_repo_that_uses_this_hook_declares_its_policy(repo):
     """The declaration is the only per-repo part left, so it is the only part

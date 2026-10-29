@@ -43,6 +43,7 @@ WHAT EACH REPOSITORY DECLARES, in its own pyproject under
     identity     = true|false     refuse author/committer/tagger addresses that
                                   are not GitHub noreply ones (default true)
     release_tags = ["v"]          tag prefixes that mean "this is a release"
+    release_backend = "pypi"     "github" builds checked GitHub Release artifacts
 
 The block is REQUIRED. A missing one is a refusal rather than a default,
 because a default here is a policy nobody chose: the wrong one silently skips a
@@ -114,7 +115,8 @@ _DISCLOSURE_CHECKER = "check_internal_disclosure.py"
 #: unchecked and carried Italian into two messages a user reads. A gate that
 #: arrives only on request is a gate the next repository will not have.
 _DEFAULTS: Dict[str, object] = {"pytest": True, "pin": True, "english": True,
-                                "identity": True, "release_tags": ["v"]}
+                                "identity": True, "release_tags": ["v"],
+                                "release_backend": "pypi"}
 
 
 class HookConfigError(Exception):
@@ -167,6 +169,8 @@ def hook_config(root: Path) -> Dict[str, object]:
     cfg.update(declared)
     if isinstance(cfg["release_tags"], str):        # a bare "v" is what a human writes
         cfg["release_tags"] = [cfg["release_tags"]]
+    if cfg["release_backend"] not in ("pypi", "github"):
+        raise HookConfigError("release_backend must be 'pypi' or 'github'")
     return cfg
 
 
@@ -717,9 +721,16 @@ def main(
         # it after made argparse exit 2, which the shell version read as a
         # refusal - so it printed REFUSED without the gate ever having run, and
         # the first "verification" of that wiring was itself wrong.
-        rc = run([py, "-m", "invisible_core.release", "--project-root", str(root),
-                  "check", "--verify-index"], root)
-        if rc == GATE_NOTHING_TO_DO:
+        if cfg["release_backend"] == "github":
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="invisible-release-") as temporary:
+                rc = run([py, "-m", "invisible_core.github_release", "--project-root", str(root),
+                          "--tag", tag.removeprefix("refs/tags/"),
+                          "--outdir", str(Path(temporary) / "dist")], root)
+        else:
+            rc = run([py, "-m", "invisible_core.release", "--project-root", str(root),
+                      "check", "--verify-index"], root)
+        if rc == GATE_NOTHING_TO_DO and cfg["release_backend"] == "pypi":
             _say("the index already has this version, byte-identical. Nothing "
                  "to publish; the publish workflow will no-op the same way.")
             ran.append("publish gate (no-op)")
@@ -739,10 +750,11 @@ def main(
                  f"above - read THAT, not this line: it refuses for several "
                  f"unrelated reasons and this hook does not know which.",
                  err=True)
-            _say("  The recurring one is a ledger the index has outrun: the "
-                 "publish workflow opens a `ledger/<version>` PR and cannot "
-                 "merge it itself, so an unmerged one blocks the NEXT "
-                 "release, not its own.", err=True)
+            if cfg["release_backend"] == "pypi":
+                _say("  The recurring one is a ledger the index has outrun: the "
+                     "publish workflow opens a `ledger/<version>` PR and cannot "
+                     "merge it itself, so an unmerged one blocks the NEXT "
+                     "release, not its own.", err=True)
             return 1
         else:
             ran.append("publish gate")

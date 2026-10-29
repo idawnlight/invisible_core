@@ -52,6 +52,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 
 from . import environment
 from .world_job import CONFTEST, PLUGIN, loads_world
@@ -138,10 +139,10 @@ def triggers(text: str) -> dict:
     return {}
 
 
-def _paths(lines: list) -> list:
+def _paths(lines: list, key: str = "paths") -> list:
     """The `paths:` of an event's lines, inline or as a block list."""
     for i, line in enumerate(lines):
-        m = re.match(r"^\s*paths:\s*(.*)$", line)
+        m = re.match(r"^\s*%s:\s*(.*)$" % re.escape(key), line)
         if not m:
             continue
         if _strip_comment(m.group(1)):
@@ -170,11 +171,22 @@ def _wait_step(text: str) -> "str | None":
     return None
 
 
-def problems(text: str) -> list:
+def problems(text: str, backend: str = "pypi") -> list:
     """What is wrong with a user-install workflow, as sentences; none when it is
     wired to run on the ledger pull request and wait there, bounded."""
     out = []
     events = triggers(text)
+    if backend == "github":
+        if "v*" not in _paths(events.get("push", []), "tags"):
+            out.append("it does not run on version-tag pushes (`push: tags: [v*]`)")
+        for event in ("workflow_dispatch", "schedule"):
+            if event not in events:
+                out.append(f"it has no {event} trigger for checking a published GitHub ref")
+        if "release" in events:
+            out.append("`release:` events created with GITHUB_TOKEN do not start this workflow; use tag pushes")
+        return out
+    if backend != "pypi":
+        return [f"unknown release backend {backend!r}"]
     if "release" in events:
         out.append("it is triggered by `release:`, which the publish workflow's "
                    "GITHUB_TOKEN never fires: the job did not run at release time")
@@ -231,7 +243,8 @@ def leak_problems(source: str) -> list:
 
 
 #: Each `python -m pytest` command of a workflow, with its continuation lines.
-_PYTEST = re.compile(r"python -m pytest(?:[^\n]*\\\n)*[^\n]*")
+_PYTEST = re.compile(r"(?:[^\s]*[/\\])?python(?:[0-9.]+)?(?:\.exe)?(?:\s+-[IEsBu]+)*"
+                     r"\s+-m pytest(?:[^\n]*\\\n)*[^\n]*")
 
 
 def world_problems(text: str, loads: bool) -> list:
@@ -249,7 +262,8 @@ def judge(root: pathlib.Path) -> list:
     """Every problem of this repository's install job, as (where, what)."""
     path = root / WORKFLOW
     text = path.read_text(encoding="utf-8")
-    found = [(WORKFLOW.as_posix(), problem) for problem in problems(text)]
+    backend = release_backend(root)
+    found = [(WORKFLOW.as_posix(), problem) for problem in problems(text, backend)]
     conftest = root / CONFTEST
     loads = conftest.is_file() and loads_world(conftest.read_text(encoding="utf-8"))
     found += [(WORKFLOW.as_posix(), problem) for problem in world_problems(text, loads)]
@@ -260,6 +274,14 @@ def judge(root: pathlib.Path) -> list:
         for problem in leak_problems(test.read_text(encoding="utf-8")):
             found.append((test.relative_to(root).as_posix(), problem))
     return found
+
+
+def release_backend(root: pathlib.Path) -> str:
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        return "pypi"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    return data.get("tool", {}).get("invisible", {}).get("hooks", {}).get("release_backend", "pypi")
 
 
 def git_root(start: "pathlib.Path | None" = None) -> pathlib.Path:
@@ -326,6 +348,7 @@ KNOWN_BAD_WORLD = (
      "          python -m pytest tests/a.py -p no:invisible_core.testing.world\n"
      "          python -m pytest tests/b.py\n"),
     ("another plugin blocked", "        run: python -m pytest tests/a.py -p no:cacheprovider\n"),
+    ("isolated harness unblocked", "        run: .install-harness/bin/python -I -m pytest tests/a.py\n"),
 )
 MUST_NOT_FIRE_WORLD = (
     ("blocked", "        run: python -m pytest tests/a.py -p no:invisible_core.testing.world\n", True),
@@ -333,6 +356,7 @@ MUST_NOT_FIRE_WORLD = (
      "          python -m pytest tests/a.py \\\n"
      "            -p no:invisible_core.testing.world -v\n", True),
     ("a conftest that does not load it", "        run: python -m pytest tests/a.py\n", False),
+    ("isolated harness blocked", "        run: .install-harness/bin/python -I -m pytest tests/a.py -p no:invisible_core.testing.world\n", True),
 )
 MUST_NOT_FIRE_FILES = (
     ("the canonical set, and more", "_LEAKS = %r\n" % (LEAKS + ("EXTRA",),)),
@@ -420,9 +444,9 @@ def main(argv=None) -> int:
         for where, problem in found:
             print("   %s: %s" % (where, problem))
         return 1
-    print("install_job: %s runs on the ledger pull request, waits for the index "
-          "bounded, and its tests keep the caller's environment out (%s)"
-          % (WORKFLOW.as_posix(), root))
+    print("install_job: %s follows its %s release triggers and its tests keep "
+          "the caller's environment out (%s)"
+          % (WORKFLOW.as_posix(), release_backend(root), root))
     return 0
 
 
