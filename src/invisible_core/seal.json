@@ -1,1 +1,1 @@
-{"assets":{},"build_id":"20261029032424","comment":"LOCAL seal generated from an unpacked tree. Not a release.","playwright":{"max":"1.61.0","min":"1.55.0"},"schema":2,"source_commit":"bfa9dfff7c2f8522e64d13cdf725d296fbc6b432","tag":"firefox-159","upstream_version":"159.0"}
+{"assets":{},"build_id":"20261029033851","comment":"LOCAL seal generated from an unpacked tree. Not a release.","playwright":{"max":"1.61.0","min":"1.55.0"},"schema":2,"source_commit":"358357508394bb2ac288ece425ba2e7e68b94957","tag":"firefox-159","upstream_version":"159.0"}
