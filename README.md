@@ -10,12 +10,12 @@ The current pair is `invisible_core 159.49.1` and
 This release provides **Linux x86_64** binaries. Python 3.11 or newer and Git
 are required.
 
-Install both Python packages from their Git tags in one command:
+Install both Python packages from their Git tags using uv:
 
 ```sh
-python -m venv .venv
+uv venv .venv
 . .venv/bin/activate
-python -m pip install \
+uv pip install \
   "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v159.49.1" \
   "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@v0.43.1"
 ```
@@ -51,7 +51,7 @@ Firefox repository maintains `release/159`; its engine tags, such as
 the default bundled seal requires a new core package version and the matching
 wrapper dependency pin.
 
-For development, install the two checkouts together with `pip install -e`.
+For development, install the two checkouts together with `uv pip install -e`.
 The unit and integration suites are under `tests/`; release workflows build
 and check the wheel and sdist before uploading them to GitHub Releases.
 
