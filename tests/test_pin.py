@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from invisible_core import _pin
+from invisible_core import pin as _pin
 
 pytestmark = pytest.mark.unit
 
@@ -84,13 +84,9 @@ def make_core(
     if init_version is not None:
         init += f'__version__ = "{init_version}"\n'
     (pkg / "__init__.py").write_text(init, encoding="utf-8")
-    # BOTH files. The implementation is `pin.py` since 2026-07-27 and `_pin.py`
-    # is a two-line alias kept for consumers built against <= 18.6.0; a
-    # synthetic install that copies only one of them is not a shape any real
-    # install has. Copying the shipped files rather than writing a stub is the
-    # point of this fixture - the derivation under test must be the real one.
+    # Copying the shipped file rather than writing a stub is the point of this
+    # fixture - the derivation under test must be the real one.
     shutil.copy2(REAL_PKG / "pin.py", pkg / "pin.py")
-    shutil.copy2(REAL_PKG / "_pin.py", pkg / "_pin.py")
     # _env.py holds the editable detector repair_core consults before it runs
     # `pip install --force-reinstall`. It was NOT copied until 2026-08-01, so
     # `from ._env import ...` raised ModuleNotFoundError in every synthetic site
@@ -106,6 +102,8 @@ def make_core(
     # environment.py names every variable the library reads (50.48.0); pin.py
     # and installer.py take their names from it.
     shutil.copy2(REAL_PKG / "environment.py", pkg / "environment.py")
+    # jar.py reads omni.ja in Mozilla's optimized layout for seal.py (2026-10-27).
+    shutil.copy2(REAL_PKG / "jar.py", pkg / "jar.py")
     if with_version:
         text = (REAL_PKG / "_version.py").read_text(encoding="utf-8")
         version = f"{tag.removeprefix('firefox-')}.{revision}.0"
@@ -153,7 +151,7 @@ def run_probe(site: Path, body: str) -> dict:
         textwrap.dedent(f"""
         import json, sys
         sys.path.insert(0, {str(site)!r})
-        from invisible_core import _pin
+        from invisible_core import pin as _pin
         out = {{"__pin_file__": _pin.__file__}}
         """)
         + textwrap.dedent(body)
@@ -679,10 +677,6 @@ def test_the_escape_hatch_warns_instead_of_raising(tmp_path, monkeypatch):
 
 # ── the module keeps its own constraints ─────────────────────────────────────
 
-# The IMPLEMENTATION, not the alias. `_pin.py` is two lines of
-# `sys.modules[__name__] = pin` since 2026-07-27; scanning it for the pip
-# seam found zero occurrences and passed nothing - a source gate pointed at
-# the wrong file reads exactly like a clean source.
 SOURCE = (REAL_PKG / "pin.py").read_text(encoding="utf-8")
 
 
@@ -882,7 +876,7 @@ def test_pin_from_requirements_takes_a_plain_list_so_every_caller_can_use_it():
 
 
 OWNED_SOURCES = {
-    "invisible_core/_pin.py": REAL_PKG / "_pin.py",
+    "invisible_core/pin.py": REAL_PKG / "pin.py",
 }
 
 
@@ -948,7 +942,7 @@ def run_autofix(
     code = textwrap.dedent(f"""
         import io, json, pathlib, sys
         sys.path.insert(0, {str(site)!r})
-        from invisible_core import _pin
+        from invisible_core import pin as _pin
 
         CALLS = []
 

@@ -35,6 +35,10 @@ def cache(tmp_path, monkeypatch):
     the state root (download.state_dir), whatever the engine store says."""
     monkeypatch.setenv("INVISIBLE_PLAYWRIGHT_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("STEALTHFOX_GEOIP_MMDB", raising=False)
+    # The index of the release is the network: these tests are about what
+    # happens after the source is chosen, so the direct link is the source.
+    monkeypatch.setattr(dl, "release_asset_urls",
+                        lambda owner, repo, tag, name, direct: [direct])
     return tmp_path
 
 
@@ -152,7 +156,7 @@ def test_download_failure_with_cache_falls_back(cache, monkeypatch):
 def test_resolve_tag_from_permalink_redirect(monkeypatch):
     class _Resp:
         headers = {"Location":
-                   "https://github.com/daijro/geoip-all-in-one/releases/download/"
+                   "https://github.com/CamoufoxCloud/geoip-all-in-one/releases/download/"
                    "2026.06.17/geoip-aio-all.mmdb.zip"}
 
     monkeypatch.setattr(dl.requests, "head", lambda *a, **k: _Resp())

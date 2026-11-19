@@ -31,14 +31,22 @@ actionability.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
 import time
+import weakref
 from typing import Any, Callable, Optional
 
+from .. import _engine_env
+from .._offloop import off_the_loop
+from .. import process as _process_module
+from ..process import TOKEN_VAR, TREE_REFRESH, EngineTree, Reaper, SessionToken, register_tree
+from . import _profile
 from .deadline import Deadline
 
 NUL = b"\x00"
@@ -219,6 +227,74 @@ class ProcessOutput:
             return list(self._lines)[-n:]
 
 
+class DeadlineClock:
+    """ONE long-lived thread that calls each registered function when its deadline comes, for everything a connection has to do LATER.
+
+    ⛔ WHY IT IS ONE THREAD STARTED ONCE, AND NOT A `threading.Timer` PER NEED. A listener runs on the connection's reader thread, and
+    `Thread.start` does not return until the new thread is running (`self._started.wait()`): on Windows under load that wait is
+    milliseconds, measured as 75% of the reader's delay, and each millisecond the reader is late moves the quiet that `networkidle` is
+    measured from (7 misses in 400 with four browsers at once; none in 400 when the start did not wait). The rule is that no thread is
+    started on the reader: the thread that serves the deadlines is made and started in `Connection.__init__`, BEFORE the reader thread
+    exists, so a listener on the reader can build a page (`Lifecycle`) at any time and only writes a deadline and wakes it.
+
+    A deadline belongs to a key (the lifecycle that asked): setting it again moves it, `cancel` takes it away. The function is called
+    OUTSIDE this lock, on this thread, one at a time, in the order of the deadlines; one that raises does not stop the others.
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._due: dict = {}
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True, name="juggler-deadlines")
+        self._thread.start()
+
+    def set(self, key: Any, delay: float, fn: Callable[[], None]) -> None:
+        """Call `fn()` in `delay` seconds, in place of what `key` had pending."""
+        with self._cv:
+            if self._stopped:
+                return
+            self._due[key] = (time.monotonic() + delay, fn)
+            self._cv.notify()
+
+    def cancel(self, key: Any) -> None:
+        with self._cv:
+            self._due.pop(key, None)
+
+    def stop(self) -> None:
+        """No deadline is called from now on and the thread ends."""
+        with self._cv:
+            self._stopped = True
+            self._due.clear()
+            self._cv.notify()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        """Wait for the thread to end after `stop` (never from the thread itself: a deadline that closes its connection)."""
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout)
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while True:
+                    if self._stopped:
+                        return
+                    if not self._due:
+                        self._cv.wait()
+                        continue
+                    key = min(self._due, key=lambda k: self._due[k][0])
+                    when, fn = self._due[key]
+                    left = when - time.monotonic()
+                    if left > 0:
+                        self._cv.wait(left)
+                        continue
+                    del self._due[key]
+                    break
+            try:
+                fn()
+            except Exception:
+                pass
+
+
 class EventListeners:
     """Who is subscribed to a connection's events, and how one is delivered.
 
@@ -271,6 +347,29 @@ class EventListeners:
         self.gone = False
         #: session -> which of its events end its waits (`end_waits_when`)
         self._ends_waits: dict = {}
+        self._deadlines: Optional[DeadlineClock] = None
+        self._deadlines_lock = threading.Lock()
+
+    def deadlines(self) -> DeadlineClock:
+        """The connection's ONE thread of deadlines (`DeadlineClock`).
+
+        ⛔ A `Connection` has it BEFORE its reader exists (`Connection.__init__` calls `start_deadlines`), so a `Lifecycle` built by a
+        listener ON the reader (the wrapper and the client build the page inside `Browser.attachedToTarget`, so that its listeners exist
+        before the session's next event is delivered) only uses it: nothing is created and nothing is started on the reader. A stand-in
+        connection (no reader, never closed) makes it here, on its first page, and the clock ends when the connection is collected."""
+        clock = self._deadlines
+        if clock is None:
+            clock = self.start_deadlines()
+        return clock
+
+    def start_deadlines(self) -> DeadlineClock:
+        """Make and start the clock once (under a lock, so two callers share it). Ends with `announce_closed` or the collection."""
+        with self._deadlines_lock:
+            if self._deadlines is None:
+                clock = DeadlineClock()
+                weakref.finalize(self, clock.stop)
+                self._deadlines = clock
+            return self._deadlines
 
     def end_waits_when(self, session: str,
                        predicate: Optional[Callable[[str, dict], bool]]) -> None:
@@ -323,6 +422,9 @@ class EventListeners:
                 return
             self.gone = True
             listeners = list(self._close_listeners)
+            clock = self._deadlines
+        if clock is not None:
+            clock.stop()
         for fn in listeners:
             try:
                 fn()
@@ -382,6 +484,65 @@ class EventListeners:
                     self.handler_errors.append("%s: %s" % (method, failure))
 
 
+#: `sys.platform == "win32"`, a name of its own so that a test can stand on either side.
+_IS_WINDOWS = sys.platform == "win32"
+#: How long a write that failed with EINVAL on Windows waits for the proof that the engine is gone (seconds).
+_GONE_WAIT = 1.0
+
+
+def _is_a_closed_pipe(exc: OSError) -> bool:
+    """A write that failed because the other end of the pipe is closed: EPIPE (`BrokenPipeError`) everywhere, and on Windows also
+    ERROR_BROKEN_PIPE (109) and ERROR_NO_DATA (232), the two codes a pipe says it by. NOT EINVAL: on Windows a pipe whose reader
+    is gone can also come out as EINVAL, but so does a descriptor that is not valid or a count out of range, and a bare errno
+    cannot tell them apart (`Connection._engine_is_gone` can)."""
+    if isinstance(exc, BrokenPipeError) or exc.errno == errno.EPIPE:
+        return True
+    return _IS_WINDOWS and getattr(exc, "winerror", None) in (109, 232)
+
+
+#: Seconds `launch` waits for an engine that did not answer its first command to leave once its pipe is closed, before ending it:
+#: it never finished starting, so it is not a browser that is exiting (`process.BROWSER_EXIT_LIMIT` is for those).
+STARTUP_CLOSE_WAIT = 5.0
+
+
+class PendingReply:
+    """The reply of a command already written (`Connection.send_async`), waited on whenever the caller chooses."""
+
+    __slots__ = ("_connection", "method", "_msg_id", "_ready", "_box")
+
+    def __init__(self, connection: "Connection", method: str, msg_id: int, ready: threading.Event, box: list) -> None:
+        self._connection = connection
+        self.method = method
+        self._msg_id = msg_id
+        self._ready = ready
+        self._box = box
+
+    def wait(self, timeout: Optional[float] = 30.0) -> tuple:
+        """The result and the place of the reply (see `Connection.send_placed`), raising what `send` raises.
+
+        ``timeout=None`` waits without a bound of its own: it still ends, because a closed pipe wakes every waiter at once with
+        TargetClosedError."""
+        conn = self._connection
+        method, msg_id, ready, box = self.method, self._msg_id, self._ready, self._box
+        arrived = ready.wait(timeout)
+        if not arrived:
+            with conn._lock:
+                conn._pending.pop(msg_id, None)
+            raise ReplyTimeout(
+                "%s: no response in %.0fs. If this is the FIRST command, "
+                "look at the readiness signal before the pipe."
+                % (method, timeout))
+        response, place = box[0]
+        if "closed" in response:
+            raise conn._closed_error(method)
+        if "interrupted" in response:
+            raise Interrupted(*response["interrupted"])
+        if "error" in response:
+            e = response["error"]
+            raise ProtocolError("%s: %s" % (method, e.get("message", e)))
+        return response.get("result"), place
+
+
 class Connection(EventListeners):
     """A pipe to an already-launched Firefox."""
 
@@ -414,6 +575,10 @@ class Connection(EventListeners):
         # ignoring a command, not as an error here.
         self._write_lock = threading.Lock()
         self._closed = False
+        #: What follows the browser's exit (`close`): the launch's `process.Reaper`, or None before the close, and for
+        #: a connection that has no process of its own.
+        self.reaper: Optional[Reaper] = None
+        self._close_lock = threading.Lock()
         self._error: Optional[BaseException] = None
         #: The browser's own output, when this connection launched it. Read
         #: here only to say why the pipe closed.
@@ -423,6 +588,8 @@ class Connection(EventListeners):
         #: The launch's deadline, from `launch`; no limit for a connection
         #: that `launch` did not make. Read by `startup_send`.
         self._startup = Deadline(None)
+        # ⛔ THE CLOCK BEFORE THE READER: no thread is ever started on the reader (see `DeadlineClock`), and a page may be built on it.
+        self.start_deadlines()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
@@ -440,7 +607,8 @@ class Connection(EventListeners):
                     if raw:
                         self._deliver(raw)
         except OSError as e:
-            self._error = e
+            with self._lock:
+                self._error = e
         finally:
             self._closed = True
             # ⛔ Whoever is waiting must be WOKEN UP, not left to the
@@ -571,6 +739,17 @@ class Connection(EventListeners):
         the page's process. The engine now ends that wait itself, inside the
         dispatch. [B230])
         """
+        return self.send_async(method, params, session).wait(timeout)
+
+    def send_async(self, method: str, params: Optional[dict] = None,
+                   session: Optional[str] = None) -> "PendingReply":
+        """Write a command and return at once, with the handle its reply is waited on later (`PendingReply.wait`).
+
+        ⛔ FOR A CALLER THAT SCHEDULES ON ITS OWN CLOCK (`_stroke.Stroke`): a command that must leave at an instant of its own plan
+        cannot wait for the reply of the one before it, because under load the engine answers late and everything behind the late
+        reply slips with it. `send` is this and the wait, in that order, and behaves exactly as it did; the wait of a handle that is
+        never waited on is simply not made (its pending entry is dropped with the reply, `_deliver`). A failure to write is raised
+        here, as in `send`; a closed pipe, an engine error or an interruption is raised by `wait`."""
         if self._closed:
             raise self._closed_error()
         with self._lock:
@@ -597,29 +776,19 @@ class Connection(EventListeners):
         msg: dict = {"id": msg_id, "method": method, "params": params or {}}
         if session:
             msg["sessionId"] = session
-        if not self._write(msg):
-            # `close` ran between the check above and the write.
+        try:
+            written = self._write(msg)
+        except BaseException:
+            # A write that fails for another reason than a closed pipe leaves nothing pending either.
+            with self._lock:
+                self._pending.pop(msg_id, None)
+            raise
+        if not written:
+            # `close` ran between the check above and the write, or the browser closed its end.
             with self._lock:
                 self._pending.pop(msg_id, None)
             raise self._closed_error()
-
-        arrived = ready.wait(timeout)
-        if not arrived:
-            with self._lock:
-                self._pending.pop(msg_id, None)
-            raise ReplyTimeout(
-                "%s: no response in %.0fs. If this is the FIRST command, "
-                "look at the readiness signal before the pipe."
-                % (method, timeout))
-        response, place = box[0]
-        if "closed" in response:
-            raise self._closed_error(method)
-        if "interrupted" in response:
-            raise Interrupted(*response["interrupted"])
-        if "error" in response:
-            e = response["error"]
-            raise ProtocolError("%s: %s" % (method, e.get("message", e)))
-        return response.get("result"), place
+        return PendingReply(self, method, msg_id, ready, box)
 
     def startup_send(self, method: str, params: Optional[dict] = None) -> Any:
         """A command that belongs to starting the browser: bounded by what is
@@ -683,16 +852,71 @@ class Connection(EventListeners):
 
     def _write(self, msg: dict) -> bool:
         """Writes one message; False, writing nothing, once `close` has
-        released the write end (see `__init__`)."""
+        released the write end (see `__init__`) or the browser has closed its
+        end of the pipe.
+
+        ⛔ THE ONE PLACE A WRITE CAN FAIL BECAUSE THE BROWSER IS GONE. An engine
+        that dies between the check at the top of `send_placed` (or the one of
+        `launch`) and this write, before the reader has seen the end of its
+        pipe, used to leave `os.write` raising a bare `BrokenPipeError`: it
+        came out of `BrowserType.launch` as "[Errno 32] Broken pipe", with
+        neither the exit code nor the last lines of the engine, which are the
+        only account of why it stopped, and nothing a client could tell from a
+        bug of its own (seen once in the e2e of the wrapper on a hosted runner,
+        2026-11-12, while 640 other launches of the same run were good). A pipe the other end has closed is the same fact as a
+        closed one, so it gets the same answer: False, which every caller turns
+        into `_closed_error()` (exit code, last output, `TargetClosedError`,
+        the word a client's rerun rules recognise), or ignores (`post`). The
+        error that the write itself raised is kept as the reason head."""
         data = json.dumps(msg).encode("utf-8") + NUL
         with self._write_lock:
             if self._to_browser < 0:
                 return False
-            os.write(self._to_browser, data)
-        return True
+            try:
+                os.write(self._to_browser, data)
+                return True
+            except OSError as exc:
+                failure = exc
+        # Decided outside the write lock: the wait below is not a reason to hold the other writers.
+        if not (_is_a_closed_pipe(failure)
+                or (_IS_WINDOWS and failure.errno == errno.EINVAL and self._engine_is_gone(_GONE_WAIT))):
+            raise failure
+        with self._lock:                     # the reader writes the same field, under the same lock
+            if self._error is None:
+                self._error = failure
+        return False
 
-    def close(self, timeout: float = 5.0) -> None:
+    def _engine_is_gone(self, wait: float) -> bool:
+        """True once the engine has exited or the reader has seen the end of its stream, waiting up to `wait` seconds for it.
+
+        Only the error branch of a write asks, and only for an error that does not say by itself that the pipe is closed (EINVAL
+        on Windows). The window is real: the pipe is already closed while `poll()` still says None, so a bare `poll()` would turn
+        the very case this is for into a rethrown EINVAL. A process that is alive and a reader that still reads are the proof
+        that the error is something else, and then the caller raises it as it came."""
+        deadline = time.monotonic() + wait
+        while True:
+            if self._closed:
+                return True
+            if self._process is not None:
+                try:
+                    if self._process.poll() is not None:
+                        return True
+                except Exception:
+                    pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    def close(self, timeout: Optional[float] = None) -> None:
         """Closes the pipe and waits for the browser to exit on its own.
+
+        ⛔ A BROWSER THAT IS EXITING IS NEVER ENDED. `timeout=None` is
+        `process.BROWSER_EXIT_LIMIT`: the net for a browser that is stuck,
+        above the time Firefox gives its own shutdown before it crashes
+        itself, and not a measure of a close (with 5 s, 26 closes of 64 were
+        ended while they were still exiting, 4 browsers together on Windows;
+        every one of them exited by itself, in 5.8 s at the median). A caller
+        that passes a `timeout` keeps it.
 
         ⛔ Do NOT start from `terminate()`, and the reason is measured in
         this project: on Windows the pid that `Popen` returns is the
@@ -706,28 +930,83 @@ class Connection(EventListeners):
         the pipe IS the exit command. `terminate()` remains only as a
         last resort, for whatever did not die on its own.
 
+        ⛔ IT RETURNS WHEN THE BROWSER HAS EXITED: the engine and the
+        processes that belong to it (content, GPU, socket, rdd, utility,
+        forkserver), told from the launch's job or process group. It does
+        not wait for the shutdown-ping sender, the one process Firefox
+        starts to outlive itself (`process.outlives_the_browser`: by its
+        command line), and it never ends it. What is left of the tree, the
+        job and the session's directories are the launch's `reaper`'s
+        (`process.Reaper`, a thread that is not a daemon, so the end of the
+        interpreter waits for it): `reaper.join()` is the wait for all of
+        it.
+
         Idempotent, and only the first call releases anything: a session has
         more than one way out, and a later call must not close a number that
         now belongs to another pipe. The read end is not closed here at all:
         the reader releases it when the browser, told by this close, ends the
         pipe (see `__init__`).
         """
+        if timeout is None:
+            timeout = _process_module.BROWSER_EXIT_LIMIT
         self._closed = True
+        # ⛔ THE TREE IS LISTED BEFORE THE PIPE CLOSES, while the engine can still say whose its children are
+        # (POSIX: what a dead engine left is reparented). One pass over the parents of the machine's processes,
+        # on the thread that closes; nothing of anybody's environment is read.
+        tree = getattr(self._process, "tree", None)
+        if tree is not None:
+            tree.remember()
         with self._write_lock:
             fd, self._to_browser = self._to_browser, -1
             if fd >= 0:
                 os.close(fd)
+        # The connection's clock ends with it, and no thread of it is left alive after `close`.
+        clock = self._deadlines
+        if clock is not None:
+            clock.stop()
+            clock.join(timeout)
         p = self._process
         if not p:
             return
         deadline = time.monotonic() + timeout
+        refreshed = time.monotonic()
         while p.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
+            time.sleep(0.01)
+            if tree is not None and time.monotonic() - refreshed >= TREE_REFRESH:
+                tree.remember()
+                refreshed = time.monotonic()
+        # ⛔ ON WINDOWS THE PROCESS THE SPAWN RETURNED MAY BE THE LAUNCHER STUB, which has exited while the
+        # browser is still shutting down, so its exit says nothing about the tree: the browser is waited for
+        # through the launch's own job (nothing of the machine is read), up to the same deadline.
+        gone = p.poll() is not None
+        if gone and tree is not None:
+            gone = tree.wait_browser_gone(deadline)
         if p.poll() is None:
             try:
                 p.terminate()
             except OSError:
                 pass
+        # What is left of THIS launch is the reaper's, and no other browser's: it waits for the sender to finish
+        # (`SENDER_GRACE`), ends what stays, releases the job (the kernel ends whatever is left of the tree) and runs
+        # what the owner of the session handed to `reaper.then`. A browser that did not exit in time is ended now.
+        with self._close_lock:
+            if self.reaper is not None:
+                return
+            if gone:
+                self.reaper = Reaper(tree, grace=_profile.SENDER_GRACE)
+            else:
+                # The browser did not exit within `timeout`: it is stuck and ended now. Once ended it is not exiting, so
+                # the reaper keeps its own default for what it is given to leave: the limit is only for the wait above.
+                self.reaper = Reaper(tree, grace=0.0)
+        self.reaper.start()
+
+    async def aclose(self, timeout: Optional[float] = None) -> None:
+        """`close()` for an event loop: the waits happen in a thread of their own
+        and the loop serves its other tasks meanwhile. Like `close()`, it returns
+        once the browser's processes have exited (the contract does not change,
+        only where the waiting is done), and a cancelled awaiter does not stop
+        the close."""
+        await off_the_loop(self.close, timeout)
 
 
 # ── launch ──────────────────────────────────────────────────────────────────
@@ -759,6 +1038,12 @@ class _WindowsProcess:
         self._handle = handle
         self.pid = pid
         self.stdout = stdout
+        #: Whether the spawn put the process inside the job (`_spawn_windows`).
+        self.in_job = False
+        #: The launch's `EngineJob`, or None (`_spawn_windows`); closed by `tree.release()`.
+        self.job = None
+        #: The launch's `EngineTree`, from the spawn: how its processes are listed, waited for and ended.
+        self.tree = None
         self.returncode: Optional[int] = None
         # Resolved now: `__del__` may run while the interpreter exits, when
         # an import inside it raises instead of closing anything.
@@ -973,10 +1258,27 @@ def _spawn_windows(executable, argv, env):
     cmdline = ctypes.create_unicode_buffer(
         subprocess.list2cmdline([executable] + argv))
     create_unicode_environment, extended_startupinfo_present = 0x400, 0x80000
+    create_suspended = 0x4
+    # ⛔ THE ENGINE IS BORN INSIDE A JOB OF ITS OWN, not adopted into one later.
+    # Created suspended, assigned while it is alone, then resumed: every process
+    # it creates after that (the launcher's browser, content, GPU, socket, and
+    # the pingsender that outlives the browser) is created inside the job by the
+    # kernel, so the tree dies with this process by construction and nothing
+    # searches the machine for it. The search this replaces ran on every launch
+    # (`LifetimeGuard.bind`: every process of the machine, its environment read
+    # under the GIL, a quarter of a second apart, up to ten seconds), measured
+    # at 12-29% of the launching thread. Adopting afterwards cannot work for this
+    # browser anyway (`JobObjectGuard.spawn_into`). ONE JOB PER LAUNCH: closing
+    # this browser (`Connection.close`) ends its tree and no other browser's,
+    # and its tree can be listed by the job itself. No job (not Windows, or it
+    # could not be made) is an ordinary launch.
+    from ..process import EngineJob
+    job = EngineJob.create()
     pi = PROCESS_INFORMATION()
     ok = k32.CreateProcessW(
         None, cmdline, None, None, True,
-        create_unicode_environment | extended_startupinfo_present,
+        create_unicode_environment | extended_startupinfo_present
+        | (create_suspended if job is not None else 0),
         env_block, None, ctypes.byref(si), ctypes.byref(pi))
     err = ctypes.get_last_error()
     k32.DeleteProcThreadAttributeList(attrs)
@@ -985,43 +1287,102 @@ def _spawn_windows(executable, argv, env):
     for h in (its_read, its_write, out_write, err_write, in_read):
         _winapi.CloseHandle(h)
     if not ok:
+        if job is not None:
+            job.close()
         for h in (our_read, our_write, out_read):
             _winapi.CloseHandle(h)
         raise OSError(err, "CreateProcessW failed for %s%s: %s" % (
             executable, (" on desktop %r" % desktop) if desktop else "",
             ctypes.FormatError(err).strip()))
+    in_job = False
+    if job is not None:
+        try:
+            # A refusal warns from inside, naming the assignment's own error.
+            in_job, _ = job.adopt_and_resume(pi.hProcess, pi.hThread)
+        except BaseException:
+            # A suspended engine nobody can resume is ended, with its pipes.
+            k32.TerminateProcess(ctypes.c_void_p(pi.hProcess), 1)
+            job.close()
+            for h in (pi.hThread, pi.hProcess, our_read, our_write, out_read):
+                _winapi.CloseHandle(h)
+            raise
     k32.CloseHandle(pi.hThread)
     stdout = os.fdopen(msvcrt.open_osfhandle(out_read, os.O_RDONLY), "rb")
     p = _WindowsProcess(int(pi.hProcess), int(pi.dwProcessId), stdout)
+    p.in_job = in_job
+    p.job = job
+    p.tree = EngineTree(p.pid, job)
     return (msvcrt.open_osfhandle(our_write, 0),
             msvcrt.open_osfhandle(our_read, os.O_RDONLY), p)
 
 
+class _PosixProcess:
+    """The things `launch` and `Connection.close` ask of a process, over a pid that `os.posix_spawn` gave: `pid`, `poll()`,
+    `returncode`, `wait()`, `terminate()`, `kill()`, `stdout` (the surface the `Popen` used to have, and `_WindowsProcess` has)."""
+
+    def __init__(self, pid: int, stdout) -> None:
+        self.pid = pid
+        self.stdout = stdout
+        self.returncode: Optional[int] = None
+        self._lock = threading.Lock()
+        #: The launch's `EngineTree`: the engine is the leader of a process group of its own (`_spawn_posix`), and
+        #: the tree is that group.
+        self.tree = EngineTree(pid, group=True, poll=self.poll)
+
+    def poll(self) -> Optional[int]:
+        with self._lock:
+            if self.returncode is None:
+                try:
+                    done, status = os.waitpid(self.pid, os.WNOHANG)
+                except ChildProcessError:
+                    # waiting for children is disabled for this process (SIGCHLD ignored): the child is gone, its status is not
+                    # knowable; `Popen` says 0.
+                    self.returncode = 0
+                else:
+                    if done == self.pid:
+                        self.returncode = os.waitstatus_to_exitcode(status)
+            return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        end = None if timeout is None else time.monotonic() + timeout
+        delay = 0.0005
+        while True:
+            code = self.poll()
+            if code is not None:
+                return code
+            if end is not None and time.monotonic() >= end:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout or 0)
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
+
+    def _signal(self, number: int) -> None:
+        if self.poll() is None:
+            try:
+                os.kill(self.pid, number)
+            except ProcessLookupError:
+                pass
+
+    def terminate(self) -> None:
+        self._signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self._signal(signal.SIGKILL)
+
+
 def _spawn_posix(executable, argv, env):
-    """⛔ IT WAS BROKEN, AND THE DOCSTRING HAD GUESSED WHICH HALF.
+    """Starts the engine with its Juggler pipe on descriptors 3 (it reads) and 4 (it writes).
 
-    This leg was written from `nsRemoteDebuggingPipe.cpp` and never executed
-    until 2026-08-28. The symptom on the first run: the browser starts, prints
-    `Juggler listening to the pipe`, stays alive - and the very first write
-    raises `BrokenPipeError`. A live process with no reader on the other end.
+    `nsRemoteDebuggingPipe.cpp` does not look the numbers up: 3 and 4 are hard-wired in the engine. So the child's descriptor table
+    is made by the SPAWN itself (`os.posix_spawn` with file actions: `dup2` of the two pipe ends onto 3 and 4, of the output pipe onto
+    1 and 2, and a close of every inherited descriptor above 4), and no Python runs in the child: nothing depends on what the
+    parent has open, and a launch from one of the server's worker threads, with other threads alive in the parent, cannot meet a
+    lock that one of them held at the fork (the documented danger of `preexec_fn`).
 
-    ⛔ THE CAUSE, MEASURED RATHER THAN REASONED. CPython's close-all-fds
-    sweep runs AFTER `preexec_fn`, so the two descriptors this function creates
-    with `dup2` are closed again before `exec` unless they are in the keep
-    list. A four-line experiment reported it exactly:
-
-        with preexec_fn + pass_fds(its_read, its_write) ->  alive=[3]
-        with 3 and 4 also kept                          ->  alive=[3, 4]
-
-    Fd 3 survived only by accident: the first `os.pipe()` in the parent
-    happened to return 3, so it was already in the keep list and the `dup2`
-    onto it was a no-op. Fd 4 was created by `dup2` and swept away - which is
-    why the browser could ANNOUNCE itself (it had a read end on 3) and never
-    receive anything (nothing owned the read end of OUR pipe once 4 died).
-
-    ⛔ The remedy is to name 3 and 4 in `pass_fds` as well. They are not open
-    in the parent and do not have to be: that list is a set of NUMBERS the
-    child's sweep spares, not a set of parent handles.
+    ⛔ IT USED TO DEPEND ON THE PARENT, and failed only sometimes. The call named 3 and 4 in `pass_fds`, which CPython makes inheritable in
+    the child BEFORE `preexec_fn` runs: a number that is not open in the parent fails the launch with `[Errno 9] Bad file
+    descriptor`. It worked when the two pipes the parent had just made happened to be on 3 and 4 (a bare shell) and failed when
+    they were not and 3 or 4 was closed (under a wrapper that leaves other descriptors open, such as `xvfb-run`). 3 and 4 were in the
+    list only because `close_fds` closes, after `preexec_fn`, whatever is not in it.
     """
     # ⛔ THE ENGINE IS DECLARED WHERE IT STARTS. On Windows the spawn is
     # `CreateProcessW` through ctypes, which raises none of the audit events
@@ -1032,43 +1393,54 @@ def _spawn_posix(executable, argv, env):
     # `invisible_core.testing.world` refuses it outside an e2e test, and a hook
     # that raises stops the spawn before anything is created.
     sys.audit(LAUNCH_EVENT, executable, argv)
+    import fcntl
+
+    def above_four(fd: int) -> int:
+        # A pipe end that is itself on 3 or 4 would be overwritten by the `dup2` of another: they are moved first.
+        if fd >= 5:
+            return fd
+        moved = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 5)
+        os.close(fd)
+        return moved
+
     its_read, our_write = os.pipe()
     our_read, its_write = os.pipe()
-
-    def fix_descriptors():
-        # On POSIX the numbers are HARDWIRED in the C++: 3 for reading,
-        # 4 for writing. `nsRemoteDebuggingPipe.cpp` does not look them up.
-        #
-        # ⛔ AND 3 AND 4 *ARE* IN `pass_fds`. This comment used to say they
-        # could not be, on the reasoning that the list names fds the parent
-        # hands down. That reasoning was wrong: the list is a set of NUMBERS
-        # the child spares during its close sweep, and the sweep runs AFTER
-        # `preexec_fn` - measured, not assumed. Without them the browser starts
-        # with nothing on 4 and the first write gets EPIPE from a live
-        # process.
-        #
-        # `dup2` clears CLOEXEC on the NEW descriptor, which is what saves this
-        # in the ordinary case - but only when the source and target differ.
-        # `dup2(fd, fd)` is documented to be a no-op that does NOT clear it, so
-        # a pipe that happens to land on 3 or 4 would be closed at exec while
-        # every other run works. The explicit `set_inheritable` below removes
-        # that difference instead of relying on which fds the OS handed out.
-        for source, target in ((its_read, 3), (its_write, 4)):
-            if source != target:
-                os.dup2(source, target)
-            os.set_inheritable(target, True)
-
-    p = subprocess.Popen([executable] + argv, env=env,
-                         preexec_fn=fix_descriptors,
-                         # ⛔ 3 and 4 ARE IN THIS LIST, see the docstring.
-                         # Without them the sweep that runs after `preexec_fn`
-                         # closes exactly the two descriptors this whole
-                         # function exists to create.
-                         pass_fds=(its_read, its_write, 3, 4),
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    os.close(its_read)
-    os.close(its_write)
-    return our_write, our_read, p
+    out_read, out_write = os.pipe()
+    its_read, its_write, out_write = above_four(its_read), above_four(its_write), above_four(out_write)
+    try:
+        for attempt in (1, 2):
+            actions = [(os.POSIX_SPAWN_DUP2, its_read, 3), (os.POSIX_SPAWN_DUP2, its_write, 4),
+                       (os.POSIX_SPAWN_DUP2, out_write, 1), (os.POSIX_SPAWN_DUP2, out_write, 2)]
+            # What close_fds did: every descriptor the parent has open and INHERITABLE is closed in the child (the ones Python
+            # makes are not inheritable and go at `exec`; these are the ones the parent was started with). A descriptor that
+            # another thread closes between this list and the spawn fails the spawn with EBADF: the list is made again once.
+            try:
+                listed = [int(name) for name in os.listdir("/dev/fd") if name.isdigit()]
+            except OSError:
+                listed = []
+            for fd in listed:
+                if fd > 4:
+                    try:
+                        if os.get_inheritable(fd):
+                            actions.append((os.POSIX_SPAWN_CLOSE, fd))
+                    except OSError:
+                        pass
+            try:
+                pid = os.posix_spawn(executable, [executable] + argv, env, file_actions=actions, setpgroup=0,
+                                     setsigdef=[getattr(signal, name) for name in ("SIGPIPE", "SIGXFSZ") if hasattr(signal, name)])
+                break
+            except OSError as error:
+                if error.errno != errno.EBADF or attempt == 2:
+                    raise
+    except BaseException:
+        for fd in (our_write, our_read, out_read):
+            os.close(fd)
+        raise
+    finally:
+        os.close(its_read)
+        os.close(its_write)
+        os.close(out_write)
+    return our_write, our_read, _PosixProcess(pid, os.fdopen(out_read, "rb"))
 
 
 #: The audit event the engine's two spawns raise before the process is
@@ -1080,9 +1452,17 @@ LAUNCH_EVENT = "invisible_core.engine.launch"
 def launch(executable: str, profile_dir: str, *, headless: bool = True,
           argv_extra: Optional[list] = None, env: Optional[dict] = None,
           ready_timeout: Optional[float] = 60.0,
-          proxy: Optional[dict] = None) -> Connection:
+          proxy: Optional[dict] = None,
+          locale: Optional[str] = None) -> Connection:
     """Launches Firefox over the pipe and returns an already-ready
     connection.
+
+    ⛔ `env` IS RAW MATERIAL, and this is where the environment of the process is BORN
+    (`_engine_env.compose`): what the host's carries of the engine's families (`MOZ_*`, the GL and
+    toolkit ones), of the zone and of the language never reaches the engine, whoever built `env`
+    (`None` is `os.environ`; the served path hands the client's), and the core writes its own over it.
+    `locale` is the session's language (`intl.locale.requested`), from which `LANG`, `LC_ALL` and
+    `LANGUAGE` are written; none declared, none written.
 
     `ready_timeout` is the caller's launch timeout, in seconds, and it bounds
     the whole startup: the readiness line, the proxy below, and whatever the
@@ -1090,7 +1470,10 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     None is no limit, which is what Playwright's `launch(timeout=0)` asks.
 
     `proxy` is the `Browser.setBrowserProxy` command
-    (`parse_proxy(...).as_engine_command()`), sent before any page exists.
+    (`parse_proxy(...).as_engine_command()`), sent before any page exists and
+    FIRST; without one the explicit `Browser.setNoBrowserProxy` is sent
+    instead, because the engine holds its proxied channels until it hears
+    which of the two the session is.
     ⛔ A PROXY THAT CANNOT BE SET CLOSES THE BROWSER: until 2026-08-30 `proxy=`
     was accepted and dropped for every scheme the engine prefs do not carry,
     and a page resolved its own DNS and went out on the host address while the
@@ -1109,9 +1492,14 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     argv += list(argv_extra or [])
     argv.append("-silent")
 
-    full_env = dict(os.environ if env is None else env)
+    full_env = _engine_env.compose(os.environ if env is None else env, locale)
     spawn = _spawn_windows if sys.platform == "win32" else _spawn_posix
     to_browser, from_browser, p = spawn(executable, argv, full_env)
+    # ⛔ THE SESSION'S TOKEN MEANS THIS LAUNCH'S TREE from here on: `find_processes` and `reap` list and end it from the
+    # tree (its job, its engine's descendants) instead of searching the machine for the processes that carry the token.
+    tree = getattr(p, "tree", None)
+    if tree is not None:
+        register_tree(SessionToken(full_env.get(TOKEN_VAR, "")), tree)
 
     # ⛔ Readiness is read on stdout, not on the pipe, and the line may
     # not come out at all on a MOZILLA_OFFICIAL build without the fix in
@@ -1136,7 +1524,11 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     # PREVIOUS engine - all to recover information the browser had already
     # written and nobody had kept.
     if p.poll() is not None:
-        # No Connection will own these two ends: released here, once.
+        # No Connection will own these two ends: released here, once. Nor the tree: what the
+        # engine left running goes with it.
+        tree = getattr(p, "tree", None)
+        if tree is not None:
+            tree.release()
         os.close(to_browser)
         os.close(from_browser)
         coda = "\n".join(("    " + r) for r in output.tail()) or "    (nothing)"
@@ -1148,18 +1540,27 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     c.ready_seen = seen
     c.output = output
     c._startup = deadline
-    if proxy is not None:
-        try:
+    # ⛔ THE FIRST COMMAND, ALWAYS. The engine's Juggler holds every proxied channel until it has been told what the
+    # session's proxy is: `Browser.setBrowserProxy`, or the explicit `Browser.setNoBrowserProxy` for a session without
+    # one. Both travel on the pipe only: a credential in the browser's environment or command line is readable by other
+    # processes of the user.
+    try:
+        if proxy is not None:
             c.startup_send("Browser.setBrowserProxy", proxy)
-        except ReplyTimeout:
-            c.close()
-            raise
-        except ProtocolError as exc:
-            c.close()
-            raise ProtocolError(
-                "the engine refused the proxy, so the browser was closed "
-                "rather than left running without one: %s" % exc) from exc
-        except BaseException:
-            c.close()
-            raise
+        else:
+            c.startup_send("Browser.setNoBrowserProxy", {})
+    except ReplyTimeout:
+        # ⛔ AN ENGINE THAT NEVER ANSWERED IS NOT EXITING: it did not finish starting, so it is not waited for as a
+        # browser that exits. The ones that answered (below) are: they leave by their pipe (`BROWSER_EXIT_LIMIT`).
+        c.close(STARTUP_CLOSE_WAIT)
+        raise
+    except ProtocolError as exc:
+        c.close()
+        what = "the proxy" if proxy is not None else "the session's 'no proxy'"
+        raise ProtocolError(
+            "the engine refused %s, so the browser was closed "
+            "rather than left running without one: %s" % (what, exc)) from exc
+    except BaseException:
+        c.close()
+        raise
     return c

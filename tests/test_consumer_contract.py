@@ -75,207 +75,55 @@ from _sibling_repositories import repository_root
 #: that release on they import the client from this package: a name leaving
 #: `invisible_core.juggler` breaks all three at import time, so all three are
 #: read.
-_CONSUMERS = ("invisible_playwright", "invisible_selenium", "invisible_puppeteer")
+_CONSUMERS = (
+    "invisible_playwright",
+    "invisible_selenium",
+    "invisible_puppeteer",
+    "invisible_chromium",
+)
 
-#: Frozen 2026-07-27 from the two consumers' sources. Every name here is imported
-#: at least once by shipped consumer code - not by their tests, which may reach
-#: for anything.
+#: Every name here is imported at least once by shipped consumer code across
+#: invisible_playwright (0.55.0 + _cdp), invisible_selenium, invisible_puppeteer,
+#: and invisible_chromium - not by their tests, which may reach for anything.
 CONTRACT = {
     "invisible_core": {
         "BINARY_VERSION", "FIREFOX_UPSTREAM_VERSION", "GeoTimezoneError",
-        # `DESKTOP_ENV` LEFT in 38.34.0. It was here because the wrapper's
-        # spawner read it (`_juggler/connection.py`), and the spawner moved
-        # into this package with the rest of the Juggler client: the name and
-        # the variable it names are now read on both sides from here, so no
-        # consumer imports it. Still exported, still `_headless.DESKTOP_ENV`.
-        #
-        # `SessionLocale` JOINED in 38.34.0, and it was late: all three
-        # consumers had imported it since 36.x (the type of
-        # `prepare_session_geo(...).locale`), and the frozen list never said
-        # so, because the live cross-check below had been reading one consumer
-        # and nobody ran it against that one.
         "SessionLocale",
-        # The Juggler client's package and the one `user.js` writer, both
-        # since 38.34.0. `juggler` is imported as a module by the wrapper's
-        # cursor, which looks the motion generator up on it by name;
-        # `write_user_js` replaced the client's own `_write_user_js`, which
-        # wrote the same lines with different line endings.
         "juggler", "write_user_js",
-        # THE ONE LANGUAGE DECISION, since 36.x. `accept_languages` (the bare
-        # table, public for one unreleased commit for the wrapper's server),
-        # `resolve_session_locale` (a raw tag every consumer wrapped in its own
-        # "auto" branch) and `consent_region_lang` (the cookie's token, read
-        # from that raw tag) LEFT together: an Australian egress resolved
-        # "en-AU" while the table started its list with "en-US", and each
-        # consumer derived values from whichever of the two it held. The
-        # consumers now read `prepare_session_geo(...).locale`, convert a
-        # context's tag with `decide_session_locale(tag).accept_languages`,
-        # and take the cookie data from `persona_cookies`. BREAKING: the
-        # consumers' pins move with this core.
-        # `decide_session_locale` LEFT in 38.34.0: no consumer's shipped code
-        # names it any more (they read `prepare_session_geo(...).locale`).
-        # Still exported and tested here; out of the contract only.
         "persona_cookies",
-        # The persistent profile's seed, since 48.41.0 (all three consumers),
-        # and LATE here for the reason `SessionLocale` was: the live check
-        # below skips unless the consumers sit beside THIS checkout, which a
-        # worktree never has, so it went unread until 2026-10-17, when a
-        # worktree of each client happened to sit next to one of the core.
         "record_session_seed", "resolve_session_seed",
-        # `IANA_TO_POSIX_TZ` LEFT with the firefox-50 pin, and the table with
-        # it: the launch writes no TZ, and the engine takes the zone from the
-        # prefs in every realm. BREAKING for a consumer that still imports it:
-        # the wrapper drops its import in the release that moves its pin here.
-        # `tz_env` remains exported but is no longer imported by the consumers.
-        "_geo", "_headless", "_proxy",
-        "_webgl_personas", "config",
-        "configure_proxy", "constants", "download", "ensure_binary",
-        # ⛔ The endpoint READER, and it is here because the consumer imports it
-        # instead of keeping a copy: on 2026-08-30 one existed in the wrapper for
-        # the duration of a fix, and it was the same duplication that had
-        # produced the defect, one floor further down.
+        "_geo",
+        "configure_proxy", "ensure_binary",
         "parse_proxy",
         "ensure_geoip_mmdb",
-        # `forced_gpu_class` LEFT on 2026-09-15, and the function did not.
-        #
-        # Two guarantees were being conflated, and this file holds only one of
-        # them. THIS list is names the consumer's shipped code imports BY NAME,
-        # and the wrapper stopped importing it that day: `generate_profile` lost
-        # its `fixed_gpu_class=` - a second spelling of `pin["gpu.class_tier"]` -
-        # so the two call sites that derived a class to pass beside the pin had
-        # nothing left to derive. Keeping it here made the contract over-claim,
-        # which is the one thing the docstring says it must not do.
-        #
-        # The OTHER guarantee is that `invisible_playwright._webgl_personas`
-        # still RESOLVES the name, because that alias module is one of the import
-        # shapes that survived the 2026-07-03 package split and the wrapper's
-        # `test_backcompat.py` names those as shipped in downstream PRs. That is
-        # a different question from "does a consumer import it", it is asserted
-        # in the wrapper where the promise was made, and it is why the function
-        # and its export stay in the core. Same shape as the three departures
-        # below: out of the contract, still in the package.
         "get_default_args", "get_default_stealth_prefs",
-        "make_virtual_display", "prefs", "prepare_session_geo",
+        "make_virtual_display", "network_to_declare", "prepare_session_geo",
         "resolve_session_timezone",
-        # `LaunchPlan`, `build_launch_plan` and `generate_profile` left on
-        # 2026-08-18 with the deletion of `invisible_firefox`, which was the only
-        # consumer that imported them: it launched the engine DIRECTLY, so the
-        # launch plan and the profile generator were its entry points, while the
-        # wrapper reaches the same work through Playwright.
-        #
-        # Same rule as every other departure in this file, and it is the rule the
-        # docstring states: a contract that over-claims freezes this package for
-        # nobody. None of the three is deleted from the core, all three are still
-        # exported, and the core's own suite covers `build_launch_plan`
-        # (test_launch.py, test_prefs_composition.py) and `generate_profile`
-        # (eleven files). `LaunchPlan` had no other mention anywhere in this
-        # suite, which is why the public-export check at the bottom of this file
-        # was written in the same commit rather than left as a gap.
-        #
-        # The 13 versions of `invisible-firefox` still on PyPI are not a reason to
-        # keep the rows: each pins `invisible-core==` exactly, so it resolves the
-        # core it was released against and no later change here can reach it.
-        # compose_session_prefs joined on 2026-08-01 and took two rows with it.
-        # The wrapper's build_prefs was the third place stacking layers on top of
-        # translate_profile_to_prefs in its own order; now it asks for the one
-        # composition, so it no longer names `translate_profile_to_prefs` or
-        # `cloak_prefs` itself. The first is still public and exported, simply
-        # not load-bearing for a consumer any more; the second was DELETED on
-        # 2026-09-20 with the in-binary cloak it switched on, and nothing
-        # outside this package had named it since 2026-08-01, which is what
-        # this contract exists to know. A contract that over-claims freezes
-        # this package for nobody.
         "compose_session_prefs",
-        # context_geometry joined in 37.33.0, replacing the same three lines in
-        # each client that computed the default context's screen and viewport
-        # from the panel's device pixels.
         "context_geometry",
-        # consent_region_lang joined on 2026-08-09, when it DELETED a table in
-        # the wrapper (`_TZ_TO_REGION`, 22 IANA zones for the CONSENT cookie),
-        # and left in 36.x with the cookie builder itself: the token is now
-        # computed inside `persona_cookies`, from the decided language.
     },
     "invisible_core._fpforge": {
-        "Profile", "_network", "_sampler", "generate_profile", "profile",
+        "Profile", "generate_profile",
     },
-    # `BINARY_VERSION` left this MODULE's row on 2026-08-18 with the deletion
-    # of `invisible_firefox`, which was the only consumer reaching for it
-    # here. The name is unchanged and still guarded: the wrapper imports it
-    # from the package, so it is still listed under `invisible_core` above,
-    # and test_constants.py / test_seal_version.py cover the derivation.
-    #
-    # ⛔ TASKBAR_PX, CHROME_W and CHROME_H WERE HERE AND CAME OUT on
-    # 2026-08-29, in the ONE direction this file allows: the consumer stopped
-    # importing them, so the rows go, per the rule in the docstring at the top.
-    # They were added on 2026-08-09 because the wrapper carried duplicate
-    # constants - _TASKBAR_H = 40 against this package's 48, and a
-    # _CHROME_W = 14 that was not merely duplicated but WRONG, since stock
-    # Firefox 151 answers outerWidth - innerWidth = 0.
-    #
-    # What changed: the wrapper imported them only to keep an old name
-    # resolving, and a simplification pass removed that re-export from
-    # `launcher.py`. Its `src/` names none of the three any more.
-    #
-    # ⛔ AND THEY ARE NOT FREE TO DELETE FROM `constants.py`, which is the part
-    # a green suite here will not tell you. The wrapper's TESTS still import
-    # all three, straight from this package now that the re-export is gone
-    # (`test_launcher_config.py`, `test_launcher_helpers.py`). That is outside
-    # this contract on purpose - the perimeter is the consumer's `src/`,
-    # because what this file exists to prevent is a USER's import failing
-    # after an upgrade, not a consumer's CI going red where the people who can
-    # fix it are already looking. Deleting the constants would turn the
-    # wrapper's suite red, immediately and visibly, which is the acceptable
-    # failure of the two.
-    #
-    # ⛔ `set()` AND NOT EMPTY BRACES. With every name gone, `{ }` is an empty
-    # DICT, and the comparison below does `dict - set` - a TypeError, not a red
-    # assertion, so the gate stops being a gate and starts being a crash. Cost
-    # of learning this: one run, because the test was there to catch it.
+    "invisible_core._offloop": {
+        "off_the_loop",
+    },
+    "invisible_core._udp_exit": {
+        "context_proxy_command", "launch_proxy_command", "stun_servers",
+    },
     "invisible_core.constants": set(),
     "invisible_core.launch": {
-        # The font manifest handover, added 2026-08-08. The engine builds its
-        # font list during app startup, before the caller's prefs exist on the
-        # Juggler path, so the manifest travels as an env var pointing at a
-        # content-addressed file - and it is verified against the engine's own
-        # face files first, because metrics for a font that is not there do not
-        # raise, they just lay the page out wrong.
         "FontManifestMismatch", "cached_font_manifest_path",
         "verify_font_manifest",
-        # The one composer of the launch environment, since 34.26.0: the
-        # wrapper's `_session.build_env` verifies the font manifest against
-        # the executable and delegates everything else here, hidden-surface
-        # variables included.
         "build_launch_env",
     },
     "invisible_core.download": {
         "cache_root", "ensure_binary",
-        # The engine store's root, printed by the wrapper's `version` beside the
-        # state root since 47.41.0 (the two roots of [B311]).
         "engine_root",
-        # ⛔ LEFT on 2026-08-28 with the deletion of Node. `_download_file`,
-        # `_parse_checksums` and `_sha256_file` had come in on 2026-08-24 for
-        # `invisible_playwright._node`, which downloaded from nodejs.org the Node
-        # the forked driver ran on. With the driver gone, no consumer imports
-        # them any more, and this gate said so on its own: a contract promising
-        # more than anyone uses freezes this package for nobody.
-        #
-        # ⛔ They were NOT deleted from the core - they stay written, tested and
-        # used by `ensure_binary`. What ends here is the PROMISE not to change
-        # them, made for a consumer that no longer exists.
-        # `engine_status` left on 2026-08-18 with the deletion of
-        # `invisible_firefox`, which showed the engine's state in its UI. Not
-        # deleted from the core and still covered by test_doctor_fix.py,
-        # test_seal_cache.py and test_seal_engine_guard.py.
-        # Two rows left on 2026-08-01 with the CLI reduction that removed the
-        # `clear-cache` subcommand: download.clear_cache, and __main__.main with
-        # the whole module row. Neither is deleted from the core - the core's own
-        # tests still cover them - they are simply no longer load-bearing for a
-        # consumer, and a contract that over-claims freezes this package for
-        # nobody.
-        # iter_cached_engines joined the contract on 2026-08-01: the wrapper's
-        # `fetch` checks every cached tree against the seal on every run, which
-        # is what the removed `doctor` subcommand used to do on request.
         "iter_cached_engines",
+    },
+    "invisible_core.jar": {
+        "open_jar",
     },
     "invisible_core.pin": {
         "AUTOFIX_ENV", "CORE_NAME", "PinDeclaration", "Requirement",
@@ -284,81 +132,54 @@ CONTRACT = {
         "installed_core_version", "normalise_name", "parse_requirement",
         "pin_declaration", "pin_from_requirements", "pin_problem",
         "pin_report", "recorded_core_version", "repair_core",
-        # Since 49.45.0, with `installer.install` below: a client's own remedy
-        # (the wrapper's Playwright range) is spelled by the tool that built the
-        # environment and rendered the way every other remedy is.
         "format_command",
     },
-    # Since 49.45.0: the install command as the tool that built the environment
-    # spells it. A client's floor cannot use it (it speaks when the core does
-    # not import) and carries its own reading of the same record.
     "invisible_core.installer": {"install"},
     "invisible_core.process": {
         "JobObjectGuard", "LifetimeGuard", "NullGuard", "SessionToken",
         "TOKEN_VAR", "alive", "find_processes", "guard_for", "psutil",
         "terminate", "wait_until_gone",
     },
-    # ── the Juggler client, since 38.34.0 (decision D85) ───────────────────
-    # What the three wrappers load from the client they used to carry each.
-    # ⛔ ONLY PUBLIC NAMES, and that was a choice made before the first
-    # release that shipped them: the wrappers' copies imported four private
-    # modules (`_behaviour`, `_motion`, `_pacing`, `_profile`) and six
-    # underscore functions, and listing those here would have made a refactor
-    # that looks internal break three published packages. The modules keep
-    # their underscore; the package re-exports the names, and the six
-    # functions lost theirs (`write_user_js` became the core's existing one).
     "invisible_core.juggler": {
-        "connection",
+        "connection", "keylayout",
         "PageActs", "PointerPersona", "Step", "initial_pointer",
         "landing_point", "plan_aimless_move", "plan_approach", "plan_idle",
         "plan_scroll", "popup_number", "steps_from_waypoints", "tail_within",
         "CursorMotion",
-        "DONE", "MIN_EVENT_INTERVAL_MS", "SLEEP", "Ev", "Pacer",
-        "clamp_to_viewport", "fine_timer", "fit_timeline",
+        "Ev",
+        "clamp_to_viewport", "fit_timeline",
         "domain_matches", "host_of", "only_set", "read_version",
         "remove_profile",
-        # Since the release after 39.34.0: the files of one browser session,
-        # which the three clients made and removed each in its own way (B223).
         "SessionFiles",
     },
+    "invisible_core.juggler._behaviour": {
+        "TypingPersona", "plan_click", "plan_press_settle", "plan_shift",
+        "plan_typing",
+    },
+    "invisible_core.juggler._gen_protocol": {
+        "protocol_source",
+    },
+    "invisible_core.juggler._pacing": {
+        "drive",
+    },
     "invisible_core.juggler.actions": {"Actions"},
-    # Interrupted since 43.39.0: invisible_selenium ends a command when a
-    # dialog opens, as Marionette does (`Page.end_waits_when`).
     "invisible_core.juggler.connection": {"Interrupted", "ProtocolError",
-                                          "TargetClosedError"},
-    # Since 41.35.0: the one meaning of "no limit" (B278).
+                                          "ReplyTimeout", "TargetClosedError"},
     "invisible_core.juggler.deadline": {"Deadline"},
     "invisible_core.juggler.injected": {
-        # ContextDestroyed since 41.36.0: a world that went, typed once here
-        # instead of matched by its sentence in each client.
-        "CALLER_WORLD", "ContextDestroyed", "EvaluationError", "InjectedScript", "UTILITY_WORLD",
-        # Since 48.42.0, imported by invisible_puppeteer: a predicate's result
-        # judged as JavaScript judges it, once here (late, as above).
-        "js_truthy",
+        "CALLER_WORLD", "ContextDestroyed", "EvaluationError", "FrameDetached",
+        "InjectedScript", "UTILITY_WORLD", "js_truthy",
     },
-    # Since 41.37.0: the browser module selenium and puppeteer each carried a
-    # copy of, here once.
     "invisible_core.juggler.instance": {"launch", "MOTION_BUDGET_PREF",
                                         "SESSION_SEED_PREF"},
-    # UnknownKey since 44.39.0: invisible-puppeteer words a key that is not on
-    # the layout as pyppeteer does ("Unknown key: X").
-    "invisible_core.juggler.keyboard": {"BUTTON_MASK", "MODIFIER_MASK",
-                                        "UnknownKey"},
-    # NavigationInterrupted since 41.36.0: another document committed in the
-    # navigation's place, which Selenium must not word as an error page.
+    "invisible_core.juggler.keyboard": {"BUTTON_MASK", "KEYBOARD_LAYOUT_PREF",
+                                        "MODIFIER_MASK", "UnknownKey",
+                                        "layouts_for", "profiles_pref"},
     "invisible_core.juggler.lifecycle": {"Lifecycle", "NavigationError",
                                          "NavigationInterrupted",
-                                         # invisible-selenium waits through a
-                                         # stop from the one stopped ([B302])
                                          "NavigationMark"},
-    # The one seed mixer: the wrapper's cursor seeds its per-action streams
-    # with it, as it did with the pointer planner's copy before 38.34.0.
     "invisible_core.seedmix": {"sub_seed"},
     "invisible_core.seal": {
-        # engine_problems joined on 2026-08-01, with iter_cached_engines above:
-        # the wrapper's `fetch` checks every cached tree against the seal on
-        # every run and prints WHY a tree does not match, which is what the
-        # removed `doctor` subcommand used to do on request.
         "EngineMismatch", "active_seal", "engine_problems", "verify_engine",
     },
 }
@@ -423,6 +244,13 @@ def test_the_frozen_contract_still_matches_the_consumers():
         src = repository_root(consumer, __file__) / "src"
         if not src.is_dir():
             pytest.skip("not the workbench - the consumer is not beside this checkout")
+        for path in src.rglob("*.py"):
+            if "playwright-upstream" in path.parts:
+                continue
+            try:
+                ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError:
+                pytest.skip(f"{consumer} has unmerged syntax conflicts in {path.name}")
         for mod, names in _imports_in(src).items():
             live.setdefault(mod, set()).update(names)
 
@@ -460,7 +288,14 @@ def test_the_private_modules_in_the_contract_are_named_as_such():
     """
     private = {m: len(n) for m, n in CONTRACT.items()
                if m.split(".")[-1].startswith("_")}
-    assert private == {'invisible_core._fpforge': 5}, (
+    assert private == {
+        'invisible_core._fpforge': 2,
+        'invisible_core._offloop': 1,
+        'invisible_core._udp_exit': 3,
+        'invisible_core.juggler._behaviour': 5,
+        'invisible_core.juggler._gen_protocol': 1,
+        'invisible_core.juggler._pacing': 1,
+    }, (
         f"the set of PRIVATE modules the consumer depends on changed: {private}.\n"
         "If it grew, a refactor that looks internal now breaks the published "
         "consumer package. If it shrank, update this test - that is progress "

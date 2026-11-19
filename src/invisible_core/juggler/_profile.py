@@ -20,14 +20,16 @@ import shutil
 from typing import Dict, Mapping, Optional
 
 from .._owned_dirs import owned_dir, sweep_owned_dirs
-from ..process import TOKEN_VAR, SessionToken, find_processes, terminate
+from .._offloop import off_the_loop
+from ..process import TOKEN_VAR, SessionToken, reap_session
 
 #: The session directories, named `<prefix><pid>_<random>` (`_owned_dirs`).
 PROFILE_PREFIX = "invisible_profile_"
 TMP_PREFIX = "invisible_tmp_"
 
-#: Seconds `SessionFiles.remove()` lets the session's surviving processes end
-#: by themselves before it ends them. What survives the browser is the
+#: Seconds `SessionFiles.remove()` and the launch's reaper (`process.Reaper`,
+#: started by `Connection.close`) let the session's surviving processes end
+#: by themselves before they end them. What survives the browser is the
 #: shutdown-ping sender (B266): measured at 0.6 s on Linux and 1.0 s on
 #: Windows, through a proxy and without. Past this the close stops waiting and
 #: the pings are lost, not leaked - the sender leaves by the session's road.
@@ -41,8 +43,10 @@ class SessionFiles:
     the browser alone: ``env`` is the environment to launch with, the given
     one with ``TMP``, ``TEMP`` and ``TMPDIR`` pointed at it, so the browser's
     temporary files belong to the session instead of the system. ``remove()``,
-    called once the browser has exited, ends whatever still carries the
-    session's token and only then takes the directories away.
+    called once the browser has exited, ends what is left of the session's tree
+    (the launch's own, `process.EngineTree`: nothing of the machine is scanned;
+    only a token no launch registered is searched for by its environment) and
+    only then takes the directories away.
 
     ⛔ THREE COPIES OF THIS LIVED IN THE CLIENTS, and all three left the
     profile behind. Measured on Windows (B223): a session longer than a minute
@@ -94,12 +98,19 @@ class SessionFiles:
         directories this session made - never a profile the caller named.
         Never raises, and a second call finds nothing to do."""
         try:
-            terminate(find_processes(self.token), grace=SENDER_GRACE)
+            reap_session(self.token, grace=SENDER_GRACE)
         except Exception:
             pass
         if self.owns_profile:
             remove_profile(self.profile)
         remove_profile(self.tmp)
+
+    async def aremove(self) -> None:
+        """`remove()` for an event loop: the wait for the survivors and the
+        removal of the directories happen in a thread of their own, and the
+        loop goes on serving whatever else it serves meanwhile. Returns when
+        `remove()` has."""
+        await off_the_loop(self.remove)
 
 
 def remove_profile(directory: str) -> None:

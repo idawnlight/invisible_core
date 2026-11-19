@@ -17,13 +17,11 @@ import pytest
 from invisible_core.constants import (
     ARCHIVE_NAME,
     BINARY_BASENAME,
-    BINARY_ENTRY_REL,
     BINARY_VERSION,
-    BROKEN_VERSIONS,
     FIREFOX_UPSTREAM_VERSION,
     RELEASE_URL_TEMPLATE,
 )
-from invisible_core.seal import Asset, SUPPORTED_LEGS, active_seal
+from invisible_core.seal import Asset, DEFAULT_ENTRY_REL, SUPPORTED_LEGS, active_seal
 
 
 @pytest.fixture
@@ -36,30 +34,8 @@ def complete_archive_seal(monkeypatch):
         suffix = f"win-{arch}.zip" if platform == "win32" else f"linux-{arch}.tar.gz"
         name = f"{BINARY_BASENAME}-{suffix}"
         assets[name] = Asset(name, platform, arch, "0" * 64, 1,
-                             BINARY_ENTRY_REL[platform], "", "20261029033851")
+                             DEFAULT_ENTRY_REL[platform], "", "20261029033851")
     monkeypatch.setattr(constants, "_SEAL", replace(constants._SEAL, assets=assets))
-
-
-@pytest.mark.unit
-def test_broken_versions_is_retired_but_still_importable():
-    """BROKEN_VERSIONS is an empty frozenset by design and stays exported only so
-    an older import site does not break.
-
-    It used to carry firefox-8, published without the juggler and therefore
-    undrivable by Playwright. Two things replaced it, and neither is a list:
-    ensure_binary refuses every tag but the sealed one, and verify_engine refuses
-    any tree with no juggler directory on every route into a launch. The assertion
-    that a superseded build cannot be handed to a user now lives in
-    invisible_core/tests/test_seal_engine_guard.py::test_tree_without_juggler_is_refused
-    and invisible_core/tests/test_seal_cache.py
-    ::test_pin_to_another_tag_is_refused_without_touching_the_network.
-
-    Kept as an emptiness assertion rather than deleted: a non-empty
-    BROKEN_VERSIONS would mean someone re-introduced a blacklist that nothing
-    reads, which is worse than not having one.
-    """
-    assert BROKEN_VERSIONS == frozenset()
-    assert BINARY_VERSION not in BROKEN_VERSIONS
 
 
 @pytest.mark.unit
@@ -147,17 +123,20 @@ def test_archive_name_rejects_unsupported_arches(machine):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("machine", ["arm64", "aarch64"])
-def test_archive_name_arm64_supported(complete_archive_seal, machine):
-    """ARM64 is shipped now (issue #6): Linux aarch64 - e macOS arm64 fino a
-    `firefox-20`, uscito il 2026-08-26.
-    ARCHIVE_NAME must map both machine spellings to the canonical -arm64 asset.
-
-    The version comes from BINARY_BASENAME rather than a literal: what this test
-    is about is the arch/platform mapping, and a hardcoded version turns every
-    upstream bump into a mechanical test edit - which is how a stale expectation
-    gets "fixed" without anyone checking the asset actually exists.
-    """
-    assert ARCHIVE_NAME("linux", machine) == f"{BINARY_BASENAME}-linux-arm64.tar.gz"
+def test_archive_name_arm64_follows_the_seal(machine):
+    """ARCHIVE_NAME maps both arm64 spellings to the -arm64 asset when a seal
+    carries one, and raises NotImplementedError without PyPI remedies when
+    oss-invisible is not used."""
+    seal = active_seal()
+    if seal.is_local or any((a.platform, a.arch) == ("linux", "arm64") for a in seal.assets.values()):
+        assert ARCHIVE_NAME("linux", machine) == f"{BINARY_BASENAME}-linux-arm64.tar.gz"
+    elif seal.contract_n > 0 and "/oss-invisible/" in RELEASE_URL_TEMPLATE:
+        with pytest.raises(NotImplementedError, match="firefox-55"):
+            ARCHIVE_NAME("linux", machine)
+    else:
+        with pytest.raises(NotImplementedError, match="no asset for platform=linux arch=arm64") as info:
+            ARCHIVE_NAME("linux", machine)
+        assert "invisible-core<56" not in str(info.value)
     # The darwin line that stood here went with the mac on 2026-08-26; the
     # refusal has a case of its own, above.
 
@@ -171,14 +150,14 @@ def test_archive_name_rejects_unsupported_platforms(platform_key):
         ARCHIVE_NAME(platform_key, "x86_64")
 
 
-# ---- ARCHIVE_NAME â†” BINARY_ENTRY_REL invariant ---------------------------- #
-# For every supported platform there MUST be an entry in BINARY_ENTRY_REL,
+# ---- ARCHIVE_NAME â†” DEFAULT_ENTRY_REL invariant ---------------------------- #
+# For every supported platform there MUST be an entry in DEFAULT_ENTRY_REL,
 # otherwise ensure_binary() will raise NotImplementedError AFTER having
 # already downloaded a 110 MB tarball - terrible UX.
 
 @pytest.mark.unit
 def test_binary_entry_rel_covers_every_supported_platform(complete_archive_seal):
-    """If ARCHIVE_NAME accepts a platform key, BINARY_ENTRY_REL must declare
+    """If ARCHIVE_NAME accepts a platform key, DEFAULT_ENTRY_REL must declare
     where the executable lives inside the archive for it.
 
     ⛔ The platform list used to be hand-written - `["win32", "linux",
@@ -190,8 +169,8 @@ def test_binary_entry_rel_covers_every_supported_platform(complete_archive_seal)
     """
     for plat, arch in SUPPORTED_LEGS:
         ARCHIVE_NAME(plat, arch)  # must not raise
-        assert plat in BINARY_ENTRY_REL, (
-            f"ARCHIVE_NAME accepts {plat!r} but BINARY_ENTRY_REL has no entry "
+        assert plat in DEFAULT_ENTRY_REL, (
+            f"ARCHIVE_NAME accepts {plat!r} but DEFAULT_ENTRY_REL has no entry "
             f"- ensure_binary() will fail late after a 110 MB download."
         )
 
@@ -199,10 +178,9 @@ def test_binary_entry_rel_covers_every_supported_platform(complete_archive_seal)
 @pytest.mark.unit
 def test_binary_entry_rel_extension_matches_platform():
     """firefox.exe on Windows, plain `firefox` on Linux."""
-    assert BINARY_ENTRY_REL["win32"].endswith(".exe")
-    assert not BINARY_ENTRY_REL["linux"].endswith(".exe")
-    assert BINARY_ENTRY_REL["linux"] == "firefox"
-    assert BINARY_ENTRY_REL["darwin"].endswith(".app/Contents/MacOS/firefox")
+    assert DEFAULT_ENTRY_REL["win32"].endswith(".exe")
+    assert not DEFAULT_ENTRY_REL["linux"].endswith(".exe")
+    assert DEFAULT_ENTRY_REL["linux"] == "firefox"
 
 
 # ---- RELEASE_URL_TEMPLATE shape ------------------------------------------- #
@@ -215,7 +193,7 @@ def test_release_url_template_is_https():
 
 @pytest.mark.unit
 def test_release_url_template_has_required_placeholders():
-    """{tag} and {asset} must both be present, otherwise _resolve_asset_url
+    """{tag} and {asset} must both be present, otherwise _resolve_asset_urls
     won't format a usable URL and downloads fail with confusing 404s."""
     assert "{tag}" in RELEASE_URL_TEMPLATE
     assert "{asset}" in RELEASE_URL_TEMPLATE

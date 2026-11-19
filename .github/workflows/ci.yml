@@ -2,11 +2,18 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
   release-support:
@@ -60,7 +67,7 @@ jobs:
       - name: arm the pre-push publish gate
         # A fresh clone has no core.hooksPath, and tests/test_release_wiring.py
         # says so. Do here what a developer does once.
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
 
       - name: undefined names and duplicate definitions
         # F821 (undefined name) and F811 (redefinition) only. Not a style pass:
@@ -279,11 +286,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: what the seal pins
+      - name: what the seal (or engine_port.json) pins
         id: seal
         run: |
           python - <<'EOF' >> "$GITHUB_OUTPUT"
-          import json
+          import json, os
           seal = json.load(open("src/invisible_core/seal.json", encoding="utf-8"))
           # The seal's (platform, arch) of each asset, in the names of
           # archive.mozilla.org; an unknown pair is refused, never skipped.
@@ -293,8 +300,11 @@ jobs:
           unknown = [p for p in pairs if p not in mar]
           if unknown:
               raise SystemExit(f"the seal ships {unknown}, which have no retail MAR name here")
-          print(f"source={seal['source_commit']}")
-          print(f"version={seal['upstream_version']}")
+          pin = seal
+          if os.path.exists("engine_port.json"):
+              pin = json.load(open("engine_port.json", encoding="utf-8"))
+          print(f"source={pin['source_commit']}")
+          print(f"version={pin['upstream_version']}")
           print("platforms=" + " ".join(mar[p] for p in pairs))
           EOF
       - name: the engine's page-surface gate, at the sealed commit
@@ -339,7 +349,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - name: arm the pre-push publish gate
         # As in `tests`: tests/test_release_wiring.py refuses an unarmed clone.
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
       - name: the default selection, with nothing outside this process
         shell: bash
         run: |

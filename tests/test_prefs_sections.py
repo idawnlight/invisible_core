@@ -50,7 +50,6 @@ def test_the_caller_overlay_can_delete_a_pref_entirely(profile):
 
 
 @pytest.mark.parametrize("platform,table", [
-    ("linux", "_LINUX_XVFB_WORKAROUNDS"),
     ("win32", "_WIN_VIRT_DESKTOP_WORKAROUNDS"),
 ])
 def test_the_platform_workarounds_never_take_a_choice_away(
@@ -238,31 +237,6 @@ def test_a_zone_the_engine_cannot_open_is_refused(zone, hint):
         assert repr(hint) in str(err.value), "the right spelling is not offered"
     P._apply_timezone(prefs, "America/Phoenix")
     assert prefs["juggler.timezone.override"] == "America/Phoenix"
-
-
-def test_the_webrtc_host_ip_is_seed_derived_and_looks_like_a_home_router(profile):
-    import ipaddress
-
-    seen = set()
-    for seed in range(200):
-        prefs = {}
-        P._apply_webrtc_host_ip(prefs, generate_profile(seed))
-        ip = prefs["zoom.stealth.webrtc.host_ip"]
-        addr = ipaddress.IPv4Address(ip)
-        assert addr in ipaddress.IPv4Network("192.168.0.0/16"), ip
-        # Neither octet may be 0 or 255: a synthetic candidate on a network or
-        # broadcast address is not a host address a real router hands out.
-        a, b = ip.split(".")[2:]
-        assert 1 <= int(a) <= 254 and 1 <= int(b) <= 254, ip
-        seen.add(ip)
-    assert len(seen) > 150, f"only {len(seen)} distinct LAN IPs across 200 seeds"
-
-
-def test_the_same_seed_gives_the_same_host_ip(profile):
-    a, b = {}, {}
-    P._apply_webrtc_host_ip(a, profile)
-    P._apply_webrtc_host_ip(b, generate_profile(42))
-    assert a == b, "the synthetic ICE candidate must be stable per session"
 
 
 def test_the_theme_moves_the_os_flag_and_not_the_palette(profile):

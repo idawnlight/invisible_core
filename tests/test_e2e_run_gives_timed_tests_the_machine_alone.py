@@ -27,7 +27,6 @@ import pytest
 from invisible_core.testing.e2e import WALL_CLOCK, passes, verdict
 
 # The run needs these plugins, as the clients' runs do.
-import pytest_rerunfailures  # noqa: F401
 import pytest_timeout  # noqa: F401
 import xdist  # noqa: F401
 

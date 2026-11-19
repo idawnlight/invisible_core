@@ -14,24 +14,22 @@ import invisible_core
 # repo under an editable install and .../Lib under a regular one, so the same
 # expression means two different things depending on how it was installed.
 REPO_ROOT = Path(__file__).resolve().parents[1]
-GATE = REPO_ROOT / "scripts" / "version_gate.py"
 HOOK = REPO_ROOT / ".githooks" / "pre-push"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "publish.yml"
-INSTALLER = REPO_ROOT / "scripts" / "install_hooks.py"
 
 pytestmark = pytest.mark.integration
 
 # These files are outside both build targets, so they are absent from an
 # installed copy and from the sdist. Skipping is correct there; failing would
 # make `pytest` red for a user who merely installed the package.
-_in_checkout = GATE.exists()
+_in_checkout = HOOK.exists()
 requires_checkout = pytest.mark.skipif(
     not _in_checkout, reason="not a source checkout - the release wiring does not ship")
 
 
 @requires_checkout
 def test_every_layer_of_the_wiring_exists():
-    missing = [str(p) for p in (GATE, HOOK, WORKFLOW, INSTALLER) if not p.exists()]
+    missing = [str(p) for p in (HOOK, WORKFLOW) if not p.exists()]
     assert missing == [], (
         "the publish gate is wired to nothing again:\n  " + "\n  ".join(missing))
 
@@ -111,7 +109,6 @@ def test_the_gate_tests_and_builds_the_tagged_source_before_artifact_upload():
                           if step.get("uses", "").startswith("actions/upload-artifact@"))
     assert test_index < build_index < artifact_index
     assert '--tag "$RELEASE_TAG"' in runs[build_index]
-
 
 
 # ------------------------------------------------------------------ layer 3

@@ -54,7 +54,7 @@ __all__ = ["tracked_file_mode", "assert_hook_is_executable",
 #: nine accidental ways; the stub is allowed to find an interpreter and hand
 #: over stdin, and nothing else.
 _POLICY_TOKENS = ("pytest", "sync_core_pin", "check_forbidden_names",
-                  "version_gate", "verify-index", "refs/tags")
+                  "invisible_core.release", "verify-index", "refs/tags")
 
 
 def tracked_file_mode(repo_root: Path, rel_path: str) -> str | None:
@@ -83,7 +83,7 @@ def assert_hook_is_executable(repo_root: Path,
 
     It survived because `core.fileMode` is false on Windows, where this is
     developed. The mode belongs to the index, so chmod-ing the working tree -
-    which `install_hooks.py` did, inside a silent `except OSError: pass` - never
+    which the old installer script did, inside a silent `except OSError: pass` - never
     fixed it and never could. A fresh clone inherits the tracked mode, so every
     clone repeated it.
 
@@ -217,7 +217,7 @@ def assert_hooks_are_armed(repo_root: Path) -> None:
         f"the pre-push gates are not armed in this clone: tests, the core pin, "
         f"the forbidden-name scan and the publish gate would all be skipped, "
         f"and the push would look exactly like a checked one.\n"
-        f"    python scripts/install_hooks.py")
+        f"    {hooks.INSTALL_COMMAND}")
 
 
 # ======================================================================

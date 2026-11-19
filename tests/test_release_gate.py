@@ -1,7 +1,7 @@
 """The publish gate, proved against known-bad input.
 
 A gate that has only ever printed PASS is not a gate, so every case below drives
-scripts/version_gate.py to a REFUSAL and asserts the exit code, the file it
+`python -m invisible_core.release` to a REFUSAL and asserts the exit code, the file it
 names and the remedy it prints. The passing cases are here too, because a gate
 that refuses everything is just as useless.
 
@@ -69,6 +69,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -113,36 +114,38 @@ BASELINE_ASSETS = {
     "firefox-151.0-stealth-linux-x86_64.tar.gz": {
         "platform": "linux", "arch": "x86_64", "sha256": "1" * 64, "size": 1,
         "entry_rel": "firefox", "omni_sha256": "", "build_id": "20260101000002"},
-    "firefox-151.0-stealth-linux-arm64.tar.gz": {
-        "platform": "linux", "arch": "arm64", "sha256": "2" * 64, "size": 1,
-        "entry_rel": "firefox", "omni_sha256": "", "build_id": "20260101000003"},
 }
 
 #: "already published and byte-identical" - a NO-OP, not a refusal.
 #: It shared exit 1 with "the content changed under an unmoved version" until
 #: 2026-07-26, and the two must not look alike to a caller: the second has to
 #: stay a hard failure, while the first is what a re-pushed or backfilled
-#: release tag legitimately produces. See scripts/version_gate.py.
+#: release tag legitimately produces. See invisible_core/release.py.
 NOTHING_TO_RELEASE = 5
-GATE = REPO_ROOT / "scripts" / "version_gate.py"
+#: The gate is a module of the package, run as one. It runs from THIS checkout's
+#: `src`, not from whatever the interpreter has installed, as the pytest
+#: `pythonpath` does for the rest of the suite.
+GATE = [sys.executable, "-m", "invisible_core.release"]
+GATE_ENV = {**os.environ, "PYTHONPATH": os.pathsep.join(
+    p for p in (str(REPO_ROOT / "src"), os.environ.get("PYTHONPATH", "")) if p)}
 
-# The whole file drives scripts/version_gate.py, and `scripts/` is NOT in the
-# sdist include list - deliberately, since the ledger and the gate are not
-# something users receive. But `tests/` IS, so unpacking the sdist and running
-# pytest gave 43 hard errors on a missing file, for a gate that is none of the
-# user's business. The `integration` marker does not save them either: this
+# The whole file drives that gate over copies of this repository, and the
+# ledger (PUBLISHED.json) is NOT in the sdist include list - deliberately, since
+# the ledger is not something users receive. But `tests/` IS, so unpacking the
+# sdist and running pytest gave 43 hard errors on a missing file, for a gate
+# that is none of the user's business. The `integration` marker does not save them either: this
 # project's addopts filter `slow` and `e2e`, not `integration`.
 #
 # The sibling file test_release_wiring.py already had exactly this guard. This
 # one is the same shape as the defect invisible_playwright records having fixed
 # once already: a maintainer-only test shipped to users who cannot make it pass.
-_in_checkout = (REPO_ROOT / "scripts" / "version_gate.py").exists()
+_in_checkout = (REPO_ROOT / "PUBLISHED.json").exists()
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         not _in_checkout,
-        reason=("not a source checkout - the publish gate lives in scripts/, "
-                "which the sdist does not ship"),
+        reason=("not a source checkout - the release ledger is not in the "
+                "sdist"),
     ),
 ]
 
@@ -200,9 +203,9 @@ def _copy_repo(dest: Path) -> Path:
 
 
 def run_gate(root: Path, *args: str) -> subprocess.CompletedProcess:
-    cmd = [sys.executable, str(GATE), "--project-root", str(root),
+    cmd = [*GATE, "--project-root", str(root),
            "--ledger", str(root / "PUBLISHED.json"), "--single-build", *args]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, env=GATE_ENV)
 
 
 def touch_content(root: Path) -> None:
@@ -225,13 +228,10 @@ def gate_module():
     normalise() is one of them: its upper bound is a property of the function and
     proving it only end-to-end costs a build per assertion.
 
-    Imported as a MODULE, not loaded from `scripts/version_gate.py` by path. The
-    implementation moved into the package on 2026-07-27 so the two consumers -
-    which pin this package exactly - can run the same gate; they had none, which
-    is how invisible-playwright 0.4.4 was uploaded from a stale tree. The script
-    is a back-compat shim now, and loading it by path gave
-    `AttributeError: module has no attribute 'normalise'` - a useful failure,
-    because it says the test was addressing the code by its old address.
+    Imported as a MODULE, which is where the implementation lives so the
+    consumers - which pin this package exactly - can run the same gate; they had
+    none, which is how invisible-playwright 0.4.4 was uploaded from a stale
+    tree.
     """
     from invisible_core import release
 
@@ -485,9 +485,9 @@ def test_the_ledger_is_readable_and_never_ships(core):
 def test_fo1_a_typo_in_the_ledger_path_is_a_hard_failure_not_a_first_release(core):
     """--ledger PUBLISHED.jsonn. One keystroke used to turn the gate off."""
     touch_content(core)
-    cmd = [sys.executable, str(GATE), "--project-root", str(core),
+    cmd = [*GATE, "--project-root", str(core),
            "--ledger", str(core / "PUBLISHED.jsonn"), "--single-build", "check"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=GATE_ENV)
     text = out_of(r)
 
     assert r.returncode == 4, text
@@ -1046,8 +1046,8 @@ NOISE = [
     ("gitignore", lambda r: _write(r, ".gitignore", "__pycache__/\n*.pyc\ndist/\n")),
     ("gitattributes", lambda r: _write(r, ".gitattributes", "* text=auto\n*.png binary\n")),
     ("line_endings_whole_tree", _flip_tree_line_endings),
-    ("the_gate_itself", lambda r: _write(r, "scripts/version_gate.py",
-                                         "# an edit to the gate is not a release\n")),
+    ("a_script_of_the_repository", lambda r: _write(r, "scripts/some_script.py",
+                                                    "# an edit to a script is not a release\n")),
     ("notes_and_makefile", lambda r: (_write(r, "NOTES.md", "# scratch\n"),
                                       _write(r, "Makefile", "test:\n\tpytest -q\n"))),
     ("githooks", lambda r: _write(r, ".githooks/pre-push", "#!/bin/sh\nexit 0\n")),
@@ -1076,9 +1076,9 @@ def test_the_default_run_builds_twice_and_the_build_is_reproducible(published_ba
     1 (release refused) - a toolchain upgrade must not read as a violation."""
     work = tmp_path / "core"
     shutil.copytree(published_baseline, work)
-    cmd = [sys.executable, str(GATE), "--project-root", str(work),
+    cmd = [*GATE, "--project-root", str(work),
            "--ledger", str(work / "PUBLISHED.json"), "show"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=GATE_ENV)
     assert r.returncode == 0, out_of(r)   # exit 2 here would mean not reproducible
     assert json.loads(r.stdout)["version"] == "18.0.0"
 
@@ -1208,5 +1208,5 @@ def test_publish_refuses_a_core_sealed_to_no_downloadable_binary(core):
     text = out_of(r)
     assert r.returncode == 1, text
     assert "no assets" in text
-    assert "roll_seal" in text
+    assert "gh release download" in text and "seal.json" in text
     assert "twine" not in text, "an upload command was formed for a local-sealed core"

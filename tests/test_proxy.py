@@ -219,8 +219,7 @@ def test_the_escape_channel_prefs_stay_on_EVERY_scheme():
         prefs = {}
         configure_proxy({"server": server}, prefs)
         assert prefs["network.proxy.allow_bypass"] is False, server
-        assert prefs["zoom.stealth.dns.no_local_resolution"] is True, server
-        assert prefs["zoom.stealth.webrtc.no_direct_udp"] is True, server
+        assert not [k for k in prefs if k.startswith("network.trr.")], server
 
 
 @pytest.mark.unit
@@ -281,36 +280,16 @@ def test_behind_any_proxy_the_direct_fallback_is_off():
             f"directly with the real IP")
 
 
-def test_behind_any_proxy_local_dns_is_declared_forbidden():
-    """`allow_bypass` closes the CHANNELS. This closes what is not a channel.
-
-    Three surfaces call `AsyncResolveNative` directly and pass through no filter:
-    `NetworkConnectivityService`, the DoH heuristics probes, and the ICE
-    resolver. The engine's gate would stop them
-    (`netwerk/dns/DNSServiceBase.cpp`, `DNSForbiddenByActiveProxy`) but it only
-    recognises a proxy written into `network.proxy.*`, and on the HTTP branch we
-    write none. So the core declares the fact: rule 1.
-
-    The worst of the three is the ICE resolver, because THE PAGE chooses the name
-    via `iceServers`: without this pref, behind an HTTP proxy a site can make the
-    browser resolve a name of its own and watch which resolver it asks - the one
-    at home - while the HTTP leaves through the proxy.
-
-    Measured 2026-08-25 behind an HTTP proxy, two identical runs: without the
-    pref 21 names resolved locally, among them `stunprobe.invalid` 6 times; with
-    the pref **3**, that is `local`, `localhost` and the proxy's endpoint - the
-    exact same shape as the SOCKS arm. The no-proxy arm stays at 28 names: the
-    pref is not written there and the engine behaves like upstream.
-    """
+def test_behind_any_proxy_the_core_declares_nothing_about_names():
+    """The engine derives the DNS-over-HTTPS state from the proxies it is given (browser and per context); the core writes
+    no ``network.trr.*`` key (``tests/test_dns_over_https_through_the_proxy.py`` has the whole contract)."""
     from invisible_core import configure_proxy
 
     for server in ("socks5://h:1080", "socks4://h:1080", "socks://h:1080",
                    "http://h:8080", "https://h:8443"):
         prefs = {}
         configure_proxy({"server": server}, prefs)
-        assert prefs.get("zoom.stealth.dns.no_local_resolution") is True, (
-            f"{server}: without this declaration a PAGE can make the browser "
-            f"resolve a name of its choosing on the resolver at home")
+        assert not [k for k in prefs if k.startswith("network.trr.")], server
 
 
 def test_without_a_proxy_the_fallback_is_not_declared():
@@ -327,9 +306,8 @@ def test_without_a_proxy_the_fallback_is_not_declared():
         configure_proxy(proxy, prefs)
         assert "network.proxy.allow_bypass" not in prefs, (
             f"{proxy!r}: pref declared where there is no proxy to bypass")
-        assert "zoom.stealth.dns.no_local_resolution" not in prefs, (
-            f"{proxy!r}: with no proxy, local DNS is the NORMAL path, and "
-            f"forbidding it would be a divergence from retail paid for nothing")
+        assert not [k for k in prefs if k.startswith("network.trr.")], (
+            f"{proxy!r}: configure_proxy writes no TRR key, with or without a proxy (the provider is declared in prefs.py)")
 
 
 def test_a_malformed_endpoint_leaves_no_half_written_prefs():
@@ -354,3 +332,25 @@ def test_a_malformed_endpoint_leaves_no_half_written_prefs():
     with pytest.raises(ValueError):
         configure_proxy({"server": "socks5://host:not-a-number"}, prefs)
     assert prefs == {}, f"prefs dirtied by the refusal: {prefs}"
+
+
+# ── credentials in the URL ───────────────────────────────────────────────────
+# `http://user:pass@host:port` was read with the userinfo as part of the host:
+# the host "user:pass@proxy.example", the credentials empty, and no error. A
+# CDP server built on the core split the URL itself before handing it over.
+
+def test_credentials_in_the_url_are_the_proxys():
+    ep = parse_proxy({"server": "http://alice:s3cret@proxy.example:8080"})
+    assert (ep.host, ep.port, ep.username, ep.password) == \
+        ("proxy.example", 8080, "alice", "s3cret")
+
+
+def test_credentials_in_the_url_are_percent_decoded():
+    ep = parse_proxy({"server": "socks5://a%40b:p%3Aw%40rd@10.0.0.1:1080"})
+    assert (ep.host, ep.username, ep.password) == ("10.0.0.1", "a@b", "p:w@rd")
+
+
+def test_credentials_given_twice_are_refused():
+    with pytest.raises(ValueError, match="give them in one place"):
+        parse_proxy({"server": "http://alice:x@proxy.example:8080",
+                     "username": "bob", "password": "y"})

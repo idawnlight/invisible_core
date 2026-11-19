@@ -30,7 +30,7 @@ import time
 
 import pytest
 
-from invisible_core import _pin
+from invisible_core import pin as _pin
 
 pytestmark = pytest.mark.unit
 

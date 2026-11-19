@@ -57,9 +57,7 @@ def entry_rel() -> str:
 
 def resources_of(root: Path) -> Path:
     """Where application.ini lives for `root`, computed independently of the
-    code under test (the darwin bundle puts it under Contents/Resources)."""
-    if sys.platform == "darwin":
-        return root / "Firefox.app" / "Contents" / "Resources"
+    code under test."""
     return root
 
 
@@ -291,9 +289,6 @@ def build_leg_tree(root: Path, entry_rel: str, *, build_id: str,
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_bytes(b"MZ\x90\x00")
     res = entry.parent
-    if entry.parent.name == "MacOS":
-        res = entry.parent.parent / "Resources"
-        res.mkdir(parents=True, exist_ok=True)
     (res / "application.ini").write_text(APP_INI.format(v=version, b=build_id), encoding="utf-8")
     (res / "platform.ini").write_text(PLAT_INI.format(v=version, b=build_id), encoding="utf-8")
     if omni:
@@ -310,12 +305,10 @@ def build_leg_tree(root: Path, entry_rel: str, *, build_id: str,
 
 @pytest.mark.parametrize("leg,entry_rel,omni", [
     # Every leg, from any host: which leg a tree IS comes from the tree, so this
-    # runs identically on the five platforms rather than only on the one the
+    # runs identically on the three platforms rather than only on the one the
     # seal's scalar happened to name.
     ("linux-arm64", "firefox", False),
     ("linux-x86_64", "firefox", False),
-    ("macos-arm64", "Firefox.app/Contents/MacOS/firefox", True),
-    ("macos-x86_64", "Firefox.app/Contents/MacOS/firefox", True),
     ("win-x86_64", "firefox.exe", True),
 ])
 def test_every_published_leg_verifies_against_the_one_seal(tmp_path, five_legs, leg,

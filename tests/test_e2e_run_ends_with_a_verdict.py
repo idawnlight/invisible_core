@@ -25,9 +25,8 @@ import time
 import psutil
 import pytest
 
-# The run needs these three plugins, as the clients' runs do; a missing one is
+# The run needs these two plugins, as the clients' runs do; a missing one is
 # a broken dev environment, not a reason to skip.
-import pytest_rerunfailures  # noqa: F401
 import pytest_timeout  # noqa: F401
 import xdist  # noqa: F401
 

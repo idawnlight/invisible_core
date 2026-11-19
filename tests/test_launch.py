@@ -26,7 +26,7 @@ def test_build_launch_plan_writes_userjs_env_and_argv(tmp_path, monkeypatch):
 
     asked = []
 
-    def fake_geo(tz, proxy, locale="auto"):
+    def fake_geo(tz, proxy, locale="auto", **_kw):
         # The language is the geo decision's: build_launch_plan hands it what
         # the caller asked for and keeps no "auto" branch of its own.
         asked.append(locale)
@@ -59,7 +59,7 @@ def test_build_launch_plan_writes_userjs_env_and_argv(tmp_path, monkeypatch):
     assert 'user_pref("zoom.stealth.screen.dpr", "1.25");' in text            # float -> string
     assert 'user_pref("toolkit.startup.max_resumed_crashes", -1);' in text    # no Safe Mode prompt
     assert 'user_pref("browser.sessionstore.resume_from_crash", false);' in text
-    assert plan.env["STEALTHFOX_WEBRTC_PUBLIC_IP"] == "198.51.100.4"
+    assert plan.env["STEALTHFOX_WEBRTC_NETWORK"].startswith("v4=")  # every session declares its network
 
 
 def test_write_user_js_emits_user_pref_lines(tmp_path):
@@ -101,13 +101,12 @@ def test_write_user_js_creates_dir_and_overwrites(tmp_path):
 def test_build_launch_env_no_font_env_but_webrtc():
     # Fonts are handled entirely in the binary (always bundle-only, self-contained),
     # so build_launch_env must NOT set any STEALTHFOX_FONTLIST/SYSTEMUI env - even
-    # when legacy font prefs are passed. WebRTC egress is still wired.
+    # when legacy font prefs are passed. The declared network is still wired.
     prefs = {"zoom.stealth.font.fontlist": "Arial,Calibri", "zoom.stealth.font.system_ui": "Segoe UI"}
-    env = build_launch_env(prefs, srflx_declared="198.51.100.4", base_env={})
+    env = build_launch_env(prefs, network_declared="v4=192.168.1.5;v6=0", base_env={})
     assert "STEALTHFOX_FONTLIST" not in env
     assert "STEALTHFOX_SYSTEMUI" not in env
-    assert env["STEALTHFOX_WEBRTC_PUBLIC_IP"] == "198.51.100.4"
-    assert env["STEALTHFOX_WEBRTC_DISABLE_IPV6"] == "1"
+    assert env["STEALTHFOX_WEBRTC_NETWORK"] == "v4=192.168.1.5;v6=0"
 
 
 @pytest.mark.parametrize("zone", ["America/Phoenix", "America/New_York", "Asia/Tokyo"])
@@ -118,28 +117,13 @@ def test_the_launch_writes_no_tz(zone):
     defect: on Windows no value satisfies both the C runtime and ICU, so
     America/Phoenix gave the machine's zone in a Worker ([B334]). The engine
     now takes the zone from juggler.timezone.override in every realm. The
-    known-bad input is a session WITH a zone, the only case that wrote one;
-    the deprecated keyword still answers, warns, and writes nothing."""
-    with pytest.warns(DeprecationWarning, match="does nothing"):
-        env = build_launch_env({"juggler.timezone.override": zone},
-                               timezone=zone, base_env={})
+    known-bad input is a session WITH a zone, the only case that wrote one."""
+    env = build_launch_env({"juggler.timezone.override": zone}, base_env={})
     assert "TZ" not in env, "the launch wrote TZ: %r" % env.get("TZ")
     prefs = compose_session_prefs(generate_profile(seed=7), locale="en-US",
                                   timezone=zone).prefs
     assert prefs["juggler.timezone.override"] == zone, (
         "positive reality: the zone is declared, in the one place the engine reads")
-
-
-def test_tz_env_is_deprecated_and_does_nothing():
-    """B: the owner's decision for firefox-50 - `tz_env` stays one release,
-    deprecated and a no-op, then goes. The table it read is gone: Phoenix, the
-    row that existed because a wrong TZ moved a session's origin, comes back
-    unchanged."""
-    import invisible_core
-
-    with pytest.warns(DeprecationWarning, match="tz_env is deprecated"):
-        assert invisible_core.tz_env("America/Phoenix") == "America/Phoenix"
-    assert not hasattr(invisible_core, "IANA_TO_POSIX_TZ")
 
 
 def test_build_launch_env_applies_the_surface_env_over_a_cleared_slot():
@@ -188,10 +172,11 @@ def test_every_session_declares_the_x11_backend(display_env):
 
 def test_build_launch_env_no_proxy_no_webrtc_no_tz():
     env = build_launch_env({}, base_env={})
-    assert "STEALTHFOX_WEBRTC_PUBLIC_IP" not in env
+    assert "STEALTHFOX_WEBRTC_NETWORK" not in env
     assert "TZ" not in env
 
 
 def test_build_launch_env_caller_webrtc_wins():
-    env = build_launch_env({}, srflx_declared="203.0.113.9", base_env={"STEALTHFOX_WEBRTC_PUBLIC_IP": "198.51.100.1"})
-    assert env["STEALTHFOX_WEBRTC_PUBLIC_IP"] == "198.51.100.1"
+    env = build_launch_env({}, network_declared="v4=192.168.1.9;v6=0",
+                           base_env={"STEALTHFOX_WEBRTC_NETWORK": "v4=10.0.0.2;v6=0"})
+    assert env["STEALTHFOX_WEBRTC_NETWORK"] == "v4=10.0.0.2;v6=0"

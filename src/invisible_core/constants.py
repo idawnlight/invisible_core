@@ -12,8 +12,7 @@ the engine.
 What IS hand-written, because no seal carries it: the "firefox-" / "-stealth"
 affixes and the per-platform archive suffixes that surround the sealed version
 in BINARY_BASENAME / ARCHIVE_NAME, RELEASE_URL_TEMPLATE (the repo that hosts the
-releases), BINARY_ENTRY_REL (seal.DEFAULT_ENTRY_REL, the executable path inside
-each archive), and the four GEOIP_* constants (a third-party repo, its asset
+releases), and the four GEOIP_* constants (a third-party repo, its asset
 name and its download URL). Those move only when the hosting repo, the archive
 layout or the upstream GeoIP project moves.
 
@@ -27,7 +26,7 @@ from typing import NamedTuple
 
 from . import environment
 from ._version import CORE_REVISION, __version__ as PKG_VERSION
-from .seal import DEFAULT_ENTRY_REL, active_seal, normalize_arch
+from .seal import active_seal, normalize_arch
 
 _SEAL = active_seal()
 
@@ -41,11 +40,6 @@ BUILD_ID: str = _SEAL.build_id
 CONTRACT_N: int = _SEAL.contract_n
 SEAL_DIGEST: str = _SEAL.digest
 SOURCE_COMMIT: str = _SEAL.source_commit
-
-# Retired. A superseded build is now simply a build no seal points at, and
-# ensure_binary() refuses any tag but the sealed one, so there is nothing to
-# blacklist. Kept as an empty frozenset for import compatibility.
-BROKEN_VERSIONS: frozenset[str] = frozenset()
 
 BINARY_BASENAME: str = f"firefox-{FIREFOX_UPSTREAM_VERSION}-stealth"
 
@@ -131,13 +125,7 @@ def ARCHIVE_NAME(platform_key: str, machine: str) -> str:
         return f"{BINARY_BASENAME}-win-{arch}.zip"
     if pk == "linux":
         return f"{BINARY_BASENAME}-linux-{arch}.tar.gz"
-    # macOS is no longer supported: no darwin name is ever built. Seals from old
-    # releases still carry darwin assets - read by the non-local branch above,
-    # which takes the name from the seal - but a LOCAL seal produces none.
     raise NotImplementedError(f"unsupported platform: {platform_key}")
-
-
-BINARY_ENTRY_REL = dict(DEFAULT_ENTRY_REL)
 
 # GitHub release URL template. Binaries are hosted on the source repo
 # (firefox_antidetect_patch) since firefox-14 - the same repo that builds them,
@@ -156,17 +144,17 @@ RELEASE_URL_TEMPLATE = release_url_template(os.environ.get(
 # ─────────────────────────────────────────────────────────────────────────
 #  GeoIP database (timezone="auto" → resolve IANA zone from proxy egress IP)
 # ─────────────────────────────────────────────────────────────────────────
-# daijro/geoip-all-in-one merges IP2Location LITE + GeoLite2 + DB-IP into a
-# single mmdb (country ISO + coordinates + IANA timezone via tzfpy), rebuilt
-# weekly. GPL-3.0, so we DOWNLOAD it at runtime into the user cache (like the
-# Firefox binary) rather than bundling it into this MIT package. The `-all`
-# variant covers IPv4+IPv6. download.py NEVER pins a tag (daijro prunes old
-# releases, so a pinned tag eventually 404s): on every launch it resolves the
-# CURRENT latest tag from the `releases/latest/download` permalink (no GitHub
-# API, no rate limit) and pulls it if newer than the cache.
-GEOIP_REPO: str = "daijro/geoip-all-in-one"
+# CamoufoxCloud/geoip-all-in-one merges IP2Location LITE + GeoLite2 + DB-IP
+# into a single mmdb (country ISO + coordinates + IANA timezone via tzfpy),
+# rebuilt weekly. GPL-3.0, so we DOWNLOAD it at runtime into the user cache
+# (like the Firefox binary) rather than bundling it into this MIT package. The
+# `-all` variant covers IPv4+IPv6. _geoip_db.py NEVER pins a tag (old releases
+# are pruned, so a pinned tag eventually 404s): on every check interval it
+# resolves the CURRENT latest tag from the `releases/latest/download` permalink
+# (no GitHub API, no rate limit) and pulls it if newer than the cache.
+GEOIP_REPO: str = "CamoufoxCloud/geoip-all-in-one"
 GEOIP_ASSET: str = "geoip-aio-all.mmdb.zip"
 GEOIP_MMDB_NAME: str = "geoip-aio-all.mmdb"
 GEOIP_RELEASE_URL_TEMPLATE: str = (
-    "https://github.com/daijro/geoip-all-in-one/releases/download/{tag}/{asset}"
+    "https://github.com/CamoufoxCloud/geoip-all-in-one/releases/download/{tag}/{asset}"
 )

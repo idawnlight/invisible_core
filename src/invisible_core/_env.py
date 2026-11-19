@@ -6,8 +6,8 @@ strong one was in the place that never acts on it:
   * `__main__.py` had a three-valued detector over four independent signals,
     refusing on `unknown` - and `__main__` is the CLI, which is forbidden from
     running pip at all (`INSTALL_RUNNER = _refuse_to_install`).
-  * `_pin.py` had `editable_core_path()`: one file, `direct_url.json`, two
-    values, `None` on any gap - and `_pin` is the module that actually runs
+  * `pin.py` had `editable_core_path()`: one file, `direct_url.json`, two
+    values, `None` on any gap - and `pin` is the module that actually runs
     `pip install --force-reinstall`, from the first line of a consumer's
     `__init__`.
 
@@ -26,7 +26,7 @@ THE RULE
 three ways the old check was defeated all produced an ABSENCE of evidence, and
 an absence of evidence must not read as a licence to overwrite somebody's work.
 
-Stdlib only. `_pin` imports this and `_pin` runs at the first line of a
+Stdlib only. `pin` imports this and `pin` runs at the first line of a
 consumer's import, so anything heavy here is paid by every user on every start.
 """
 from __future__ import annotations

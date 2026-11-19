@@ -184,9 +184,15 @@ class Lifecycle:
         self.c = connection
         self.session = session
         self.frames: dict = {}
+        # The frames that left (detached, or dropped at a commit above them): a late event of one makes no frame.
+        self._left_frames: set = set()
         self.main_frame: Optional[str] = None
         self.ready = False
-        self._inflight = 0
+        #: The requests in flight, as Playwright keeps them: a map from request id to the frame that owns it and the
+        #: navigation it belongs to, not a count. A count has no way to forget a request whose end never comes (a
+        #: beacon cancelled with the page, a request closed before the client answered it): one such request kept
+        #: `networkidle` away from every later document of a page that is reused. See `_forget_requests`.
+        self._open: dict = {}
         #: The session's ONE memory of which requests are its favicon: this
         #: lifecycle feeds it, a page's server asks it (`favicon.py`).
         self.favicons = FaviconRequests()
@@ -205,21 +211,30 @@ class Lifecycle:
         #: which keeps the rule; `_check_alive` raises it).
         self._interruptions = 0
         self._interruption: Optional[tuple] = None
+        #: The page's planned navigations not yet started: a `Page.linkClicked`
+        #: "before" whose "after" has not arrived (`wait_for_action_signals`).
+        self._link_clicks = 0
         #: Who hears what only this object can decide: `announce(what,
         #: frame_id, url=None)`, called UNDER the lock and BEFORE any waiter
         #: is woken, so whatever it sends upward is on its way before the
         #: answer of a wait that the same event satisfies. Set by the page
         #: once its channel exists. `what` is one of `frameAttached` (a frame
         #: id seen for the first time), `frameDetached` (a frame gone, its own
-        #: detach or its parent's new document), `networkidle` and
-        #: `sameDocument`: the frame tree is this object's, and a client that
-        #: keeps frames of its own builds and retires them from these alone.
+        #: detach or its parent's new document), `networkidle`,
+        #: `sameDocument` and `commit` (with `name=` and `navigation=`, the
+        #: commit's id or None for a document re-announced): the frame tree is
+        #: this object's, and a client that keeps frames of its own builds and
+        #: retires them from these alone.
         self.announce = None
-        #: The one pending silence check, or None. See `_settle`.
-        self._settle_timer: Optional[threading.Timer] = None
+        #: Whether a silence check is pending on the connection's clock (`DeadlineClock`). See `_settle`.
+        self._settle_pending = False
+        #: The connection's one thread of deadlines, taken HERE (never on the reader, which only writes a deadline into it).
+        self._clock = connection.deadlines()
         #: The connection has ended (`_on_close`): no event will come, and a
         #: wait - with a limit or without one - says so instead of waiting.
         self._gone = False
+        #: The page this follows went away (`detach`): no event will come for it, and a wait says so instead of waiting.
+        self._detached = False
         # ⛔ REGISTERED, NOT CHAINED, and the difference is not style: this
         # used to capture the previous `on_event` and install a closure over
         # it, so every page added a nested call to the delivery of every
@@ -241,9 +256,11 @@ class Lifecycle:
         self.c.remove_close_listener(self._on_close)
         with self._cv:
             self.announce = None
-            if self._settle_timer is not None:
-                self._settle_timer.cancel()
-                self._settle_timer = None
+            self._clock.cancel(self)
+            self._settle_pending = False
+            # A wait on this page, with or without a limit, ends now (a page closed before it was ready, a target that went away).
+            self._detached = True
+            self._cv.notify_all()
 
     def _on_close(self) -> None:
         with self._cv:
@@ -263,6 +280,9 @@ class Lifecycle:
         if self._gone:
             raise TargetClosedError(
                 "the browser closed while waiting for %s" % waiting_for)
+        if self._detached:
+            raise TargetClosedError(
+                "the page was closed while waiting for %s" % waiting_for)
         if began is not None and self._interruptions != began:
             raise Interrupted(*self._interruption)
 
@@ -288,7 +308,7 @@ class Lifecycle:
                 self._cv.notify_all()
             f = self._apply(method, p)
             self._settle()
-            if f is not None or method.startswith("Network."):
+            if f is not None or method.startswith("Network.") or method == "Page.ready":
                 self._cv.notify_all()
 
     def _settle(self) -> None:
@@ -307,8 +327,12 @@ class Lifecycle:
         current document.
 
         ⛔ AND IT IS BORN ON A SILENCE DEADLINE, when NOTHING happens, so no
-        event can deliver it: a timer does, one at a time. A check that finds
-        activity since it was scheduled schedules the remainder.
+        event can deliver it: the connection's clock does (`DeadlineClock`: one
+        thread for every page of the connection, started before the first
+        event; a thread started here would be started ON THE READER, and
+        `Thread.start` waits for the new thread to run), one check at a time
+        per page. A check that finds activity since it was scheduled schedules
+        the remainder.
 
         Once given it stays until the next document, as in Playwright: a
         request the page makes later does not take it back.
@@ -322,7 +346,7 @@ class Lifecycle:
                                    ("networkidle2", 2, self._last_crowded)):
             waiting = [f for f in self.frames.values()
                        if "load" in f.states and state not in f.states]
-            if not waiting or self._inflight > most:
+            if not waiting or len(self._open) > most:
                 continue
             quiet_for = now - since
             if quiet_for < IDLE_QUIET:
@@ -333,19 +357,29 @@ class Lifecycle:
                 f.states.add(state)
                 self._tell(state, f.id)
             self._cv.notify_all()
-        if later is not None and self._settle_timer is None:
-            self._settle_timer = threading.Timer(later, self._settle_later)
-            self._settle_timer.daemon = True
-            self._settle_timer.start()
+        if later is not None and not self._settle_pending:
+            self._settle_pending = True
+            self._clock.set(self, later, self._settle_later)
 
     def _settle_later(self) -> None:
         with self._cv:
-            self._settle_timer = None
+            self._settle_pending = False
             self._settle()
 
     def _apply(self, method: str, p: dict):
         if method == "Page.ready":
             self.ready = True
+            return None
+
+        if method == "Page.linkClicked":
+            # The engine pairs every "before" with one "after", sent when the
+            # planned navigation starts or is cancelled (nsDocShell's
+            # NotifyJugglerLinkClick); the floor is for an engine that does not.
+            if p.get("phase") == "before":
+                self._link_clicks += 1
+            elif self._link_clicks:
+                self._link_clicks -= 1
+            self._cv.notify_all()
             return None
 
         if method == "Page.frameAttached":
@@ -366,6 +400,7 @@ class Lifecycle:
             # cross-process navigation").
             fid = p["frameId"]
             parent = p.get("parentFrameId")
+            self._left_frames.discard(fid)
             f = self.frames.get(fid)
             if f is None:
                 f = self.frames[fid] = Frame(fid, parent)
@@ -385,6 +420,8 @@ class Lifecycle:
 
         if method == "Page.navigationStarted":
             f = self._frame(p["frameId"])
+            if f is None:
+                return None
             f.navigation = p["navigationId"]
             f._started.setdefault(f.navigation, self.c.delivered)
             # ⛔ THIS is where the correctness of the whole file lives: the
@@ -403,9 +440,13 @@ class Lifecycle:
             # it commits belong to the document being replaced; the new
             # document's attach after. Playwright retires them at the same
             # moment (`frameCommittedNewDocumentNavigation`).
-            self._retire(p["frameId"], itself=False)
             f = self._frame(p["frameId"])
+            if f is None:
+                return None
+            self._retire(p["frameId"], itself=False)
             nav = p.get("navigationId")
+            if nav is not None:
+                self._forget_requests({f.id}, keep_navigation=nav)
             f.url = p.get("url", f.url)
             # The frame's name (the iframe's `name`, or its `id`), which the
             # engine sends with every commit and pyppeteer's `frame.name` reads.
@@ -424,15 +465,26 @@ class Lifecycle:
                 # the lifecycle at the commit too.
                 f.states = set()
             f.states.add("commit")
+            # Announced HERE, as `sameDocument` is: the page's `navigated` goes
+            # up before a wait this commit ends is answered. ⛔ Sent from the
+            # page's own listener, which runs after this one, it raced a
+            # click's answer: from Firefox 157 click() waits for the commit
+            # of the navigation it planned, and `page.url` read right after
+            # it still named the page it had left (2026-10-27).
+            self._tell("commit", f.id, f.url, name=f.name, navigation=nav)
             return f
 
         if method == "Page.navigationAborted":
             f = self._frame(p["frameId"])
+            if f is None:
+                return None
             f.aborted[p["navigationId"]] = p.get("errorText", "aborted")
             return f
 
         if method == "Page.sameDocumentNavigation":
             f = self._frame(p["frameId"])
+            if f is None:
+                return None
             f.url = p.get("url", f.url)
             f.same_document += 1
             # ⛔ No clearing here: it is the same document.
@@ -444,6 +496,8 @@ class Lifecycle:
 
         if method == "Page.eventFired":
             f = self._frame(p["frameId"])
+            if f is None:
+                return None
             name = p.get("name")
             if name == "load":
                 f.states.add("load")
@@ -461,30 +515,60 @@ class Lifecycle:
         if method.startswith("Network.") and self.favicons.see(method, p):
             return None
 
+        if method == "Network.requestWillBeSent" and p.get("method") == "OPTIONS" and not p.get("isIntercepted"):
+            # ⛔ AS PLAYWRIGHT'S OWN SERVER (ffNetworkManager `_onRequestWillBeSent`: `if (event.method === "OPTIONS" &&
+            # !event.isIntercepted) return;`): an OPTIONS request that no route holds is a CORS preflight the browser makes
+            # for the page. The page's frame never learns of it, so `networkidle` does not count it; counting it here made
+            # a page with preflighted fetches wait for requests stock Firefox ignores. Its end finds no request and is nothing.
+            return None
+
         if method == "Network.requestWillBeSent":
             nav = p.get("navigationId")
             if nav:
                 self._record_went(nav, p.get("url"))
-            self._inflight += 1
+            frame_id = p.get("frameId")
+            replaced = p.get("redirectedFrom")
+            if replaced:
+                # The hop replaces the request it redirects (the engine may never end the old id), in the same frame.
+                old = self._open.pop(replaced, None)
+                if old and not frame_id:
+                    frame_id = old[0]
+            rid = p.get("requestId")
+            # Playwright drops a request whose frame it does not have: a beacon sent at `pagehide` is announced after
+            # its frame left, no end ever comes for it, and held here it would keep `networkidle` away for good.
+            if rid is not None and frame_id not in self._left_frames:
+                self._open[rid] = (frame_id, nav)
             self._last_activity = time.monotonic()
-            if self._inflight > 2:
+            if len(self._open) > 2:
                 self._last_crowded = self._last_activity
         elif method in ("Network.requestFinished", "Network.requestFailed"):
-            if self._inflight > 2:
+            if len(self._open) > 2:
                 self._last_crowded = time.monotonic()
-            # It never drops below zero: a response without its request
-            # does arrive for real, for instance for a load that started
-            # before we hooked in, and a negative counter would make
-            # `networkidle` unreachable forever.
-            self._inflight = max(0, self._inflight - 1)
+            # An end for a request not held is nothing: a response without its request does arrive for real (a load
+            # that started before we hooked in), an end can come twice, and a request may already have been forgotten
+            # with its document. It can neither close another request nor make the count negative.
+            self._open.pop(p.get("requestId"), None)
             self._last_activity = time.monotonic()
         return None
 
-    def _tell(self, what: str, frame_id: str, url: Optional[str] = None) -> None:
+    def _forget_requests(self, frame_ids, keep_navigation=None) -> None:
+        """Drop the requests of these frames, except the one of `keep_navigation` (the new document's own request,
+        which ends with it). A request without a frame belongs to the main frame. Called when a frame commits a new
+        document and when frames leave: the requests of a document that is gone cannot hold the next one."""
+        ids = set(frame_ids)
+        for rid, (owner, nav) in list(self._open.items()):
+            # A request of a frame this page does not have (its attach never reached us, or it left) can only be held
+            # by a request whose end we will never see: it goes with the next document, as Playwright's never counted it.
+            orphan = owner is not None and owner not in self.frames
+            if orphan or ((owner or self.main_frame) in ids and not (keep_navigation and nav == keep_navigation)):
+                del self._open[rid]
+
+    def _tell(self, what: str, frame_id: str, url: Optional[str] = None,
+              **detail) -> None:
         """Hand `what` to whoever listens (`announce`), under the lock and
         before any waiter is woken."""
         if self.announce is not None:
-            self.announce(what, frame_id, url)
+            self.announce(what, frame_id, url, **detail)
 
     def _retire(self, frame_id: str, *, itself: bool) -> None:
         """Remove `frame_id`'s descendants, and the frame too if `itself`,
@@ -492,8 +576,10 @@ class Lifecycle:
         gone = [k for k in self.frames
                 if self._descendants(k, frame_id) or (itself and k == frame_id)]
         gone.sort(key=lambda k: -self._depth(k))
+        self._forget_requests(gone)
         for k in gone:
             self.frames.pop(k, None)
+            self._left_frames.add(k)
         for k in gone:
             self._tell("frameDetached", k)
 
@@ -515,9 +601,25 @@ class Lifecycle:
             cur = self.frames.get(cur.parent)
         return False
 
-    def _frame(self, fid: str) -> Frame:
-        # An event can name a frame we never saw attach (we hooked in on an
-        # already-live page). It gets created instead of being lost.
+    def _frame(self, fid: str) -> Optional[Frame]:
+        """The frame `fid` names; None for a frame that left.
+
+        ⛔ A LATE EVENT OF A FRAME THAT LEFT IS NOT A FRAME. Its process can still
+        report `navigationStarted`, a commit or a `load` after `frameDetached` (or
+        after a commit above it dropped it); created again, with no parent, it was
+        a ghost in the client's `page.frames` that no document holds. Playwright's
+        frame manager drops the events of a frame it does not hold
+        (`frameRequestedNavigation`, `frameAbortedNavigation`,
+        `frameLifecycleEvent`: `if (!frame) return`).
+
+        ⛔ BUT AN ID NEVER SEEN IS STILL A FRAME. A Lifecycle made for a page that
+        is already live (the Juggler clients that attach to a page: actions,
+        injected, the posix pipe) never sees the page's first `frameAttached`, and
+        its first event is how it learns the main frame. Refusing those (the first
+        version of this fix, 580bf80) answered "the page has not announced its main
+        frame yet" to every goto of theirs: 30 e2e red on candidate #5."""
+        if fid in self._left_frames:
+            return None
         if fid not in self.frames:
             self.frames[fid] = Frame(fid, None)
             if self.main_frame is None:
@@ -646,6 +748,65 @@ class Lifecycle:
                                   began)
                 if deadline.passed():
                     return None
+                self._cv.wait(deadline.slice(0.05))
+
+    def wait_for_action_signals(self, frame_id: str, since: "NavigationMark",
+                                timeout: Optional[float]) -> None:
+        """After an input action, wait for the navigations it set off: every
+        planned one to start (`Page.linkClicked` "before" ... "after"), and the
+        one `frame_id` started after the mark `since` to commit, abort, or stay
+        in the same document. Playwright's `waitForSignalsCreatedBy`, which its
+        click and press run unless `noWaitAfter`; only the main frame counts,
+        as there (`SignalBarrier.addFrameNavigation`).
+
+        ⛔ FROM FIREFOX 157 A FORM SUBMISSION IS A PLANNED NAVIGATION
+        (`dom.forms.submit_async_navigation`, the retail's default): it starts
+        after the click that submitted it has returned. Measured 2026-10-27:
+        the POST was announced 7 ms after `page.click()` came back, so
+        `click()` then reading the requests saw none, where 151 had it before.
+        The engine now reports the plan before the click's answer, and this
+        waits for it; the page sees the retail's timing either way.
+        """
+        deadline = Deadline(timeout)
+        with self._cv:
+            while True:
+                f = self.frames.get(frame_id)
+                if self._link_clicks == 0:
+                    if (f is None or f.navigation == since.navigation
+                            or f.same_document != since.same_document
+                            or "commit" in f.states
+                            or f.navigation in f.aborted):
+                        return
+                self._check_alive("the navigation started by an action on frame %s"
+                                  % frame_id, since.interruptions)
+                if deadline.passed():
+                    raise TimeoutError(
+                        "an action's navigation did not finish in %.0fs: %d planned "
+                        "navigation(s) not started, frame %s at %s"
+                        % (timeout, self._link_clicks, frame_id,
+                           f.navigation if f else None))
+                self._cv.wait(deadline.slice(0.05))
+
+    def wait_for_page_ready(self, timeout: Optional[float] = 20.0) -> None:
+        """Return once the engine has said the page is ready (`Page.ready`), waiting for it to arrive.
+
+        ⛔ A PAGE IS HANDED TO THE CALLER ONLY WHEN IT IS READY, as Playwright does (`FFPage` reports the page as new on `Page.ready`).
+        The engine sends it "whenever the page has completed initialization, e.g. finished all the transient navigations to the
+        `about:blank`" (PageHandler.js). Handing the page over on the main frame alone, the caller's first `goto` could be sent
+        while the page's own initial `about:blank` was still to commit: `Frame.outcome` takes the first document committed after
+        the reply of the command, that one is not ours, and the `goto` fails with "interrupted by another navigation to
+        about:blank" (measured on a loaded machine: three different tests, two runs of the CI, and `new_context().new_page()`
+        followed by `goto` in a loop in a fourth). `Page.ready` is replayed to a lifecycle built after it was sent, so a page that
+        was already ready returns at once.
+        """
+        deadline = Deadline(timeout)
+        with self._cv:
+            while not self.ready:
+                self._check_alive("the page to be ready")
+                if deadline.passed():
+                    raise TimeoutError(
+                        "the page was not ready in %.0fs: the engine never said Page.ready (frames seen: %s)"
+                        % (timeout, sorted(self.frames)))
                 self._cv.wait(deadline.slice(0.05))
 
     def wait_for_main_frame(self, timeout: Optional[float] = 20.0) -> str:
@@ -792,7 +953,7 @@ class Lifecycle:
                                   % (sorted(f.states) or "none"))
                     raise TimeoutError(
                         "%s not reached in %.0fs (%s, inflight requests: "
-                        "%d)" % (state, timeout, reason, self._inflight))
+                        "%d)" % (state, timeout, reason, len(self._open)))
                 # networkidle comes true on a SILENCE DEADLINE, when nothing
                 # happens; `_settle`'s timer notifies then, so every state
                 # can sleep until the next notify.
@@ -832,6 +993,9 @@ class Lifecycle:
         # the command is on its way ends the wait.
         with self._cv:
             f = self._frame(fid)
+            if f is None:
+                raise RuntimeError("Frame was detached: %s is not attached to the "
+                                   "page" % fid)
             before = f.same_document
             began = self._interruptions
             f.asked += 1
@@ -857,7 +1021,13 @@ class Lifecycle:
         # (measured 2026-10-04, one step behind on every fragment goto).
         if nav is None:
             with self._cv:
-                while self._frame(fid).same_document == before:
+                while True:
+                    f = self._frame(fid)
+                    if f is None:
+                        raise RuntimeError("Frame was detached during the "
+                                           "same-document navigation to %s" % url)
+                    if f.same_document != before:
+                        break
                     self._check_alive("the same-document navigation to %s" % url,
                                       began)
                     if deadline.passed():
@@ -939,4 +1109,4 @@ class Lifecycle:
 
     @property
     def inflight(self) -> int:
-        return self._inflight
+        return len(self._open)

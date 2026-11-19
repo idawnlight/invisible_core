@@ -23,24 +23,12 @@ import time
 from typing import Any, Iterable, List, Optional, Tuple
 
 from .. import environment
-
-try:  # the path generator is optional; the floor it declares is not
-    from . import _motion as _motion_mod
-except Exception:  # noqa: BLE001 - an unimportable generator is not fatal here
-    _motion_mod = None  # type: ignore[assignment]
+from ._motion import SAMPLE_FLOOR_MS
 
 #: Two pointer events closer together than this describe a device nobody sells.
 #: Firefox coalesces mouse moves to the refresh rate, so a page on a real 60 Hz
-#: display cannot see two of them 2 ms apart.
-#:
-#: The fallback is only reached when _motion failed to import, in which case the
-#: session is already falling back to the browser's own expansion; keeping a
-#: floor here rather than None means a timeline still refuses to emit a rate no
-#: device produces.
-MIN_EVENT_INTERVAL_MS = (
-    float(getattr(_motion_mod, "SAMPLE_FLOOR_MS", 8.0))
-    if _motion_mod is not None else 8.0
-)
+#: display cannot see two of them 2 ms apart. The floor is the path generator's.
+MIN_EVENT_INTERVAL_MS = float(SAMPLE_FLOOR_MS)
 
 #: Windows quantises a waited-on timer to the system tick, which is 15.6 ms by
 #: default: a 12 ms sleep comes back at 16.7 ms (measured, p50), and there is no
@@ -388,7 +376,7 @@ def fit_timeline(evs: List[Ev], budget_s: float) -> List[Ev]:
 
 def drive(evs: Iterable[Ev], emit_move: Any, *, emit_wheel: Any = None,
           emit_last: bool = True, now: Any = None, sleep: Any = None,
-          origin: Optional[Tuple[float, float]] = None) -> int:
+          origin: Optional[Tuple[float, float]] = None, timed: bool = False) -> int:
     """The SYNCHRONOUS driver of :class:`Pacer`. Returns events sent.
 
     The asynchronous one lives in :mod:`._cursor`, because it has to ``await``
@@ -398,7 +386,9 @@ def drive(evs: Iterable[Ev], emit_move: Any, *, emit_wheel: Any = None,
 
     ``now`` and ``sleep`` are injectable so a test can drive a whole timeline
     without waiting for it. ``origin`` is where the pointer is before the plan
-    starts, the reference for the pacer's reach until something is sent.
+    starts, the reference for the pacer's reach until something is sent. With ``timed`` the move emitter is also given the
+    event's planned instant (``t_ms``, from the start of the plan) as a third argument, and so is the wheel emitter
+    (``emit_wheel(dx, dy, t_ms)``).
     """
     evs = list(evs)
     if not evs:
@@ -418,9 +408,15 @@ def drive(evs: Iterable[Ev], emit_move: Any, *, emit_wheel: Any = None,
                 if emit_wheel is None:
                     pacer.dropped()  # nothing here can carry a notch
                     continue
-                emit_wheel(arg.dx, arg.dy)
+                if timed:
+                    emit_wheel(arg.dx, arg.dy, arg.t_ms)
+                else:
+                    emit_wheel(arg.dx, arg.dy)
             else:
-                emit_move(arg.x, arg.y)
+                if timed:
+                    emit_move(arg.x, arg.y, arg.t_ms)
+                else:
+                    emit_move(arg.x, arg.y)
             pacer.emitted(clock())
     return pacer.delivered
 

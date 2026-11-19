@@ -52,7 +52,7 @@ from pathlib import Path
 import pytest
 
 from invisible_core import __main__ as doctor
-from invisible_core import _pin
+from invisible_core import pin as _pin
 from invisible_core.installer import install
 from invisible_core.__main__ import EDITABLE, NOT_EDITABLE, UNKNOWN, DistFacts
 
@@ -382,18 +382,18 @@ def test_the_doctor_module_cannot_start_a_process_at_all():
 
 
 def test_the_doctor_imports_only_the_reading_half_of_pin():
-    """The doctor shares _pin's parser, and _pin also contains an INSTALLER.
+    """The doctor shares pin's parser, and pin also contains an INSTALLER.
 
     invisible_core.pin grew a real pip runner (_run_pip / INSTALL_RUNNER /
     enforce_core_pin) for the consumers' import floor, which is allowed to
     repair the environment it was imported into. The doctor is not: it reports.
     Since the doctor now imports that module, "this file cannot start a process"
-    stops being provable from this file's own imports alone - `from ._pin import
+    stops being provable from this file's own imports alone - `from .pin import
     INSTALL_RUNNER` names nothing banned and calls nothing banned.
 
     So the import is pinned to the reading half by name. The runtime tripwire
     above still covers the dynamic path (it patches subprocess itself, and
-    _pin's runner imports subprocess inside the function, so it resolves the
+    pin's runner imports subprocess inside the function, so it resolves the
     patched attribute); this is the static half.
     """
     readers = {"CORE_NAME", "pin_from_requirements", "pin_declaration",
@@ -416,13 +416,13 @@ def test_the_doctor_imports_only_the_reading_half_of_pin():
     tree = ast.parse(Path(doctor.__file__).read_text(encoding="utf-8"))
     imported = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").lstrip(".") == "_pin":
+        if isinstance(node, ast.ImportFrom) and (node.module or "").lstrip(".") == "pin":
             imported += [(node.lineno, alias.name) for alias in node.names]
-    assert imported, "the doctor no longer imports _pin: check the parser is still shared"
-    offences = [f"line {n}: from ._pin import {name}"
+    assert imported, "the doctor no longer imports pin: check the parser is still shared"
+    offences = [f"line {n}: from .pin import {name}"
                 for n, name in imported if name not in readers]
     assert offences == [], (
-        "the doctor imported something from _pin that is not a reader. _pin can "
+        "the doctor imported something from pin that is not a reader. pin can "
         "install; doctor may not:\n  " + "\n  ".join(offences))
 
 
@@ -965,7 +965,7 @@ def test_the_doctor_carries_no_second_copy_of_the_pin_parser():
                 offences.append(f"line {node.lineno}: re.{func.attr}({arg.value!r})")
     assert offences == [], (
         "invisible_core/__main__.py parses a requirement specifier again. That "
-        "parser lives in invisible_core/_pin.py, once:\n  " + "\n  ".join(offences))
+        "parser lives in invisible_core/pin.py, once:\n  " + "\n  ".join(offences))
 
 
 def test_the_doctor_understands_the_parenthesised_dialect_of_the_pin(env, capsys):

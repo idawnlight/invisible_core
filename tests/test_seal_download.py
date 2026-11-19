@@ -45,10 +45,10 @@ from pathlib import Path
 import pytest
 import responses
 
+from invisible_core import download
 from invisible_core.constants import RELEASE_URL_TEMPLATE
 from invisible_core.download import (
     cache_dir_for_seal,
-    cache_dir_for_version,
     cache_root,
     ensure_binary,
 )
@@ -75,6 +75,10 @@ BUILD_IDS = {
     ("darwin", "arm64"): "20260724042803",
 }
 INFIX = {"win32": "win", "linux": "linux", "darwin": "macos"}
+#: The executable path inside each archive, as the SEAL carries it. The macOS
+#: line is data a published seal still holds, not something the core builds.
+SEALED_ENTRY_REL = {"win32": "firefox.exe", "linux": "firefox",
+                    "darwin": "Firefox.app/Contents/MacOS/firefox"}
 EXT = {"win32": "zip", "linux": "tar.gz", "darwin": "tar.gz"}
 
 APP_INI = ("[App]\nVendor=Mozilla\nName=Firefox\nVersion={v}\nBuildID={b}\nSourceStamp=0123456789abcdef\n\n"
@@ -102,8 +106,6 @@ def asset_name(plat: str, arch: str, version: str = SEALED_VERSION) -> str:
 
 def resources_of(root: Path, plat: str) -> Path:
     """Where application.ini lives, computed independently of the code under test."""
-    if plat == "darwin":
-        return root / "Firefox.app" / "Contents" / "Resources"
     return root
 
 
@@ -167,7 +169,7 @@ def write_seal(path: Path, *, tag: str = "firefox-18", version: str = SEALED_VER
         assets[asset_name(plat, arch, version)] = {
             "platform": plat, "arch": arch, "build_id": build_id,
             "sha256": (sha_for or {}).get((plat, arch), "00" * 32),
-            "size": 1, "entry_rel": DEFAULT_ENTRY_REL[plat],
+            "size": 1, "entry_rel": SEALED_ENTRY_REL[plat],
             # Empty by default, which is what every leg of a Linux seal carries
             # (that archive tars the unpacked layout and has no omni.ja). It
             # also means the ADOPTION digest check is never entered by default -
@@ -187,13 +189,17 @@ def write_seal(path: Path, *, tag: str = "firefox-18", version: str = SEALED_VER
 
 @pytest.fixture
 def cache(tmp_path, monkeypatch):
-    """An isolated cache root, plus the public-repo download path (no token), so
-    _resolve_asset_url returns the direct URL instead of calling the API."""
+    """An isolated cache root, plus the public-repo download path (no token), with the
+    direct link as the only source: the API route is tested in test_download.py."""
     root = tmp_path / "Cache"
     root.mkdir()
     monkeypatch.setenv("INVISIBLE_PLAYWRIGHT_CACHE_DIR", str(root))
     monkeypatch.delenv("STEALTHFOX_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    # The index of the release is the network: these tests are about what
+    # happens after the source is chosen, so the direct link is the source.
+    monkeypatch.setattr(download, "release_asset_urls",
+                        lambda owner, repo, tag, name, direct: [direct])
     got = cache_root()
     assert got == root, f"cache_root() ignored the override: {got}"
     assert str(got).startswith(str(tmp_path)), "refusing to run against a real cache"
@@ -431,43 +437,16 @@ def test_unsupported_arch_raises_before_any_network(cache, tmp_path, monkeypatch
     assert len(responses.calls) == 0, "it must refuse before the first request"
 
 
-# ------------------------------------------------- the back-compat path helper
+# ------------------------------------------------- the cache directory
 
-def test_cache_dir_for_version_no_arg_is_the_sealed_content_key():
-    """The no-arg call used to name cache_root()/<tag>. It now names the
-    content-keyed directory for the ACTIVE seal, which is the path the test
-    harnesses look the fetched engine up under (and, until its 2026-08-18
-    deletion, the profile manager did too)."""
+def test_cache_dir_for_the_seal_is_the_content_key():
+    """The cache directory names the tag, the base version and the BuildID of the
+    ACTIVE seal, which is the path the test harnesses look the fetched engine up
+    under."""
     s = active_seal()
-    p = cache_dir_for_version()
-    assert p == cache_dir_for_seal(s)
+    p = cache_dir_for_seal(s)
     assert p.name == f"{s.tag}_{s.upstream_version}_{s.build_id}"
     assert p.parent == cache_root()
-
-
-def test_cache_dir_for_the_sealed_tag_is_the_same_directory():
-    """Spelling out the tag you already have must not resolve somewhere else, or
-    a caller that passes it would fetch the same engine twice."""
-    s = active_seal()
-    assert cache_dir_for_version(s.tag) == cache_dir_for_version()
-
-
-def test_cache_dir_for_another_tag_keeps_the_legacy_flat_name():
-    """Any other tag resolves to the old flat layout: that is what a warm cache
-    from before the seal is called on disk, and clear-cache and enumeration have
-    to be able to name it. It is never a directory ensure_binary installs into."""
-    s = active_seal()
-    other = cache_dir_for_version("firefox-3")
-    assert other.name == "firefox-3"
-    assert other.parent == cache_root()
-    assert other != cache_dir_for_version(s.tag)
-
-
-def test_two_tags_never_share_a_directory():
-    """firefox-3 and firefox-4 must never collide: extraction would clobber one
-    with the other and break every downgrade."""
-    a, b = cache_dir_for_version("firefox-3"), cache_dir_for_version("firefox-4")
-    assert a != b and a.parent == b.parent
 
 
 def test_cache_root_is_a_path_that_names_the_product():
@@ -734,10 +713,9 @@ def test_the_download_path_never_installs_anything():
 def test_ensure_binary_refuses_macos(cache, tmp_path, monkeypatch):
     """On a Mac ``ensure_binary`` stops at the boundary; it attempts no download.
 
-    macOS has not been a target since 2026-08-26. The refusal comes BEFORE the
-    seal is looked at, with a message naming the reason - no mac binary is
-    published - rather than leaving an obscure failure further downstream. The
-    seal handed in is non-local and valid (a real linux/win leg) so it clears the
+    The refusal is the generic one for a platform no engine is published for: it
+    names the declared legs, and has no case of its own for macOS. The seal handed
+    in is non-local and valid (a real linux/win leg) so it clears the
     ``is_local`` check and reaches the platform branch: it is that branch which
     refuses, not a missing asset.
     """
@@ -745,5 +723,6 @@ def test_ensure_binary_refuses_macos(cache, tmp_path, monkeypatch):
     seal, _name, _bytes, _bid = publish(tmp_path, plat)
     monkeypatch.setattr(sys, "platform", "darwin")
     with pytest.raises(NotImplementedError,
-                       match="macOS is no longer a supported platform"):
+                       match="not one we publish an engine for") as exc:
         ensure_binary(seal=seal)
+    assert "macOS" not in str(exc.value)

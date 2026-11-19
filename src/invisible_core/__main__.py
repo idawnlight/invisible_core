@@ -91,10 +91,10 @@ from importlib import metadata
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-from ._pin import CORE_NAME as CORE_DIST
-from ._pin import format_command
-from ._pin import pin_from_requirements
-from ._pin import repair_command
+from .pin import CORE_NAME as CORE_DIST
+from .pin import format_command
+from .pin import pin_from_requirements
+from .pin import repair_command
 from ._version import __version__ as DERIVED_CORE_VERSION
 from .download import (cache_root, clear_cache, engine_root, engine_status, ensure_binary,
                        iter_cached_engines)
@@ -118,7 +118,7 @@ EXIT_PROBLEM = 1
 EXIT_UNVERIFIED = 2
 
 # Characters that make a shell do something other than pass the token through.
-# The command formatter is `_pin.format_command`. This module carried a
+# The command formatter is `pin.format_command`. This module carried a
 # byte-identical second copy of it AND of its `_NEEDS_QUOTING` set - recorded as
 # open item 9 in 18-gate-inventory.md, "same class as the parser forks".
 #
@@ -321,7 +321,7 @@ def _pin_remedy(p: PinProblem) -> List[str]:
                    "version is already present.")
     # The ONLY place in this module where an install command comes into
     # existence, and it is the import-time repair's own command
-    # (`_pin.repair_command`): what the doctor prints and what the repair runs
+    # (`pin.repair_command`): what the doctor prints and what the repair runs
     # cannot disagree. It is spelled by the tool that installed the core (this
     # used to be `python.exe -m pip install`, and the environment the README
     # makes has no pip) and names the interpreter by its full path, so the line

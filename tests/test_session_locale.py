@@ -47,7 +47,7 @@ def _ip_picking(country, build):
 
 def _egress_country_is(monkeypatch, country, *, ip="203.0.113.7"):
     """Discovery answers `ip`, the database maps it to `country`. Counts asks."""
-    import invisible_core.download as dl
+    import invisible_core._geo as dl
 
     asked = {"discover": 0, "locale": 0}
 

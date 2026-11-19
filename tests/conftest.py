@@ -147,7 +147,7 @@ def _no_geoip_download(monkeypatch, request):
     """
     if request.node.get_closest_marker("e2e"):
         return
-    import invisible_core.download as _dl
+    import invisible_core._geo as _dl
 
     sentinella = pathlib.Path(__file__).with_name("_geoip_db_not_downloaded_in_tests.mmdb")
     monkeypatch.setattr(_dl, "ensure_geoip_mmdb", lambda *a, **kw: sentinella,
@@ -175,28 +175,69 @@ def _no_egress_discovery(monkeypatch, request):
     the defect itself. The callers already treat a failed discovery as their
     real code does: an explicit zone goes on without a position, "auto" raises.
 
-    The refusal sits on `_geo`'s OWN handle to the network, not on
-    `discover_egress_ip`: the tests of discovery itself stub
-    `_geo.requests.get` and must still reach the real function, and every
+    The refusal sits on `_geo`'s OWN seam to the network (`_geo._http_get`),
+    not on `discover_egress_ip`: the tests of discovery itself stub
+    `_geo._http_get` and must still reach the real function, and every
     other module's `requests` - the downloads, which `responses` mocks one
     layer lower - is left alone. A test that wants an exit stubs
-    `_geo.discover_egress_ip` or `_geo.requests.get`, which overrides this;
+    `_geo.discover_egress_ip` or `_geo._http_get`, which overrides this;
     an `e2e` test gets the network.
+
+    The direct exit is kept for two minutes per process (`_geo._egress_kept`),
+    so each test also starts with nothing kept and nothing in flight: an answer
+    one test chose must not be the answer of the next.
     """
     if request.node.get_closest_marker("e2e"):
         return
     from invisible_core import _geo
 
-    class _GeoNetwork:
-        def __init__(self, real):
-            self._real = real
+    def refuse(*a, **kw):
+        raise _ExitNotAskedInTests(
+            "a hermetic test asked the network for its exit address; "
+            "monkeypatch invisible_core._geo.discover_egress_ip to give it one")
 
-        def __getattr__(self, name):
-            return getattr(self._real, name)
+    monkeypatch.setattr(_geo, "_http_get", refuse)
+    monkeypatch.setattr(_geo, "_egress_kept", None)
+    monkeypatch.setattr(_geo, "_egress_flight", None)
 
-        def get(self, *a, **kw):
-            raise _ExitNotAskedInTests(
-                "a hermetic test asked the network for its exit address; "
-                "monkeypatch invisible_core._geo.discover_egress_ip to give it one")
 
-    monkeypatch.setattr(_geo, "requests", _GeoNetwork(_geo.requests))
+@pytest.fixture(autouse=True)
+def _udp_exit_is_measured_only_through_loopback(monkeypatch, request):
+    """The sibling of the two above, for the UDP half of the exit.
+
+    `prepare_session_geo` measures a SOCKS5 proxy's UDP exit beside the TCP one (`invisible_core._udp_exit`), and a
+    hermetic test that gives it `socks5://gw.example:1080` would look the name up on the network, or wait for a
+    connection to a documentation address that never answers. So a hermetic test measures only through a gateway ON
+    LOOPBACK (the fakes of `_udp_gateway.py`); any other proxy yields an `error` outcome, i.e. `unmeasured`, without
+    a socket. An `e2e` test gets the network."""
+    if request.node.get_closest_marker("e2e"):
+        return
+    import ipaddress
+
+    from invisible_core import _udp_exit
+
+    real = _udp_exit.probe_udp_exit
+
+    def probe(endpoint, *args, **kwargs):
+        try:
+            loopback = ipaddress.ip_address(endpoint.host).is_loopback
+        except ValueError:
+            loopback = False
+        return real(endpoint, *args, **kwargs) if loopback else _udp_exit.UdpProbe("error")
+
+    monkeypatch.setattr(_udp_exit, "probe_udp_exit", probe)
+
+
+@pytest.fixture(autouse=True)
+def _geoip_check_memory_is_per_test(monkeypatch):
+    """`ensure_geoip_mmdb` asks GitHub at most once per process: a test is a process of its own as far as that memory goes.
+
+    The memory lives in the module, so there is one to clear only once the module is loaded. It is read from
+    `sys.modules` and never imported here: the user-install job runs with pytest alone on the runner (the package under
+    test is in a venv the test builds from the index), and an import in an autouse fixture fails the setup of every
+    test of that job."""
+    import sys
+
+    geoip_db = sys.modules.get("invisible_core._geoip_db")
+    if geoip_db is not None:
+        monkeypatch.setattr(geoip_db, "_CHECKED_THIS_PROCESS", False, raising=False)

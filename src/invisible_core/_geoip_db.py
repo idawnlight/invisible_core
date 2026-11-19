@@ -19,10 +19,14 @@ mechanics get written twice.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import requests
@@ -35,9 +39,48 @@ from .constants import (
     GEOIP_REPO,
 )
 from .download import (DOWNLOAD_ATTEMPTS, _download_file, _extract,
-                       _github_token, state_dir)
+                       _github_token, release_asset_urls, state_dir)
 
 __all__ = ["ensure_geoip_mmdb", "geoip_mmdb_path"]
+
+#: How often GitHub is asked which tag is the latest: once per interval, kept in a file beside the database. A session used to ask on EVERY call of
+#: `ensure_geoip_mmdb` (about three per launch: the country of the exit, the zone, the coordinates), each a name resolution and a round trip of its own at
+#: the start of the session; the database is rebuilt weekly, so a check a day loses nothing.
+GEOIP_CHECK_INTERVAL_S = 24 * 3600
+
+#: Where the time of the last good check is kept: a file of the geoip root, not inside a tag directory (nothing that lists the tags or the databases sees it).
+_CHECK_STATE_NAME = ".last-check.json"
+
+#: Set by the first check of this process, good or not: a process asks GitHub at most once. A failed check is not written to the state file (the next
+#: process asks again) but is not repeated in this process either.
+_CHECKED_THIS_PROCESS = False
+
+#: The file that serialises the check and the download across the processes of the machine: beside the state file, in the geoip root, where the glob of the
+#: databases and the prune of the tags (directories only) do not see it. An OS lock, so a process that dies releases it and nothing is left that blocks.
+_LOCK_NAME = ".download.lock"
+
+#: The longest a process waits for another one to finish the check or the download. Past it the process goes on without the lock: a downloader that hangs
+#: must not hang every launch behind it, and the worst case of going on is the download this lock exists to avoid, never a wrong database.
+_LOCK_WAIT_S = 300.0
+
+#: The one check/download in flight in this process, or None. Guarded by `_flight_lock`.
+_flight = None
+_flight_lock = threading.Lock()
+
+
+class _Flight:
+    """What the callers of one process wait for: the result of the check or download the first of them runs, or the error it ended with."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.result = None
+        self.error = None
+
+    def wait(self):
+        self.done.wait()
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 def _geoip_root() -> Path:
@@ -54,12 +97,99 @@ def _cached_geoip_mmdb() -> Path | None:
     return cands[-1] if cands else None
 
 
+def _check_state_path() -> Path:
+    return _geoip_root() / _CHECK_STATE_NAME
+
+
+def _check_is_due() -> bool:
+    """True when GitHub has to be asked: not yet by this process, and the last good check is older than the interval (or unreadable, or from the future)."""
+    if _CHECKED_THIS_PROCESS:
+        return False
+    return _state_is_due()
+
+
+def _state_is_due() -> bool:
+    """The state file alone: the last good check of ANY process of the machine is older than the interval (or unreadable, or from the future)."""
+    try:
+        stamp = json.loads(_check_state_path().read_text(encoding="utf-8"))["checked_at"]
+        if isinstance(stamp, bool):
+            return True  # JSON true is not a time
+        checked_at = float(stamp)  # an integer too large for a float raises OverflowError
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
+        return True
+    age = time.time() - checked_at
+    return not (0 <= age < GEOIP_CHECK_INTERVAL_S)
+
+
+def _record_check() -> None:
+    """The time of a check that reached GitHub. Best effort: a root that cannot be written only means the next process asks again."""
+    path = _check_state_path()
+    tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"checked_at": time.time()}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+@contextmanager
+def _machine_lock():
+    """Held while the latest tag is asked and the database downloaded: one process at a time, the others wait and then read what it left. Best effort
+    by design - a root that cannot be written, or a holder that does not let go within `_LOCK_WAIT_S`, means going on without it, not failing the launch."""
+    handle = None
+    try:
+        root = _geoip_root()
+        root.mkdir(parents=True, exist_ok=True)
+        handle = open(root / _LOCK_NAME, "a+b")
+    except OSError:
+        handle = None
+    locked = False
+    if handle is not None:
+        deadline = time.monotonic() + _LOCK_WAIT_S
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if locked:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                handle.close()
+
+
 def _geoip_latest_url() -> str:
     return f"https://github.com/{GEOIP_REPO}/releases/latest/download/{GEOIP_ASSET}"
 
 
 def _latest_geoip_tag_api() -> str:
-    """Latest ``daijro/geoip-all-in-one`` release tag via the GitHub API
+    """Latest ``CamoufoxCloud/geoip-all-in-one`` release tag via the GitHub API
     (fallback for :func:`_resolve_latest_geoip_tag` when the permalink HEAD
     can't be parsed)."""
     headers = {"Accept": "application/vnd.github+json"}
@@ -128,6 +258,8 @@ def _download_geoip_tag(tag: str, *, attempts: int) -> Path:
     if found is not None:
         return found
     url = GEOIP_RELEASE_URL_TEMPLATE.format(tag=tag, asset=GEOIP_ASSET)
+    owner, repo = GEOIP_REPO.split("/", 1)
+    sources = release_asset_urls(owner, repo, tag, GEOIP_ASSET, url)
     root = _geoip_root()
     root.mkdir(parents=True, exist_ok=True)
     # Beside the tag directories, on the same filesystem so the rename is
@@ -136,7 +268,7 @@ def _download_geoip_tag(tag: str, *, attempts: int) -> Path:
     try:
         with tempfile.TemporaryDirectory() as td:
             archive = Path(td) / GEOIP_ASSET
-            _download_file(url, archive, attempts=attempts)
+            _download_file(sources, archive, attempts=attempts)
             _extract(archive, staging)
         mmdb = _mmdb_in(staging)
         if mmdb is None:
@@ -197,16 +329,26 @@ def geoip_mmdb_path() -> Path | None:
 
 
 def ensure_geoip_mmdb() -> Path:
-    """Return the geoip mmdb, always the latest daijro build. Checked on EVERY
-    call - a single cheap permalink HEAD (no GitHub API, so no rate limit).
+    """Return the geoip mmdb, the latest daijro build. GitHub is asked which tag is
+    the latest ONCE per interval (`GEOIP_CHECK_INTERVAL_S`, a day, kept in a file
+    beside the database) and at most once per process - not on every call: a
+    launch calls this about three times and each used to be a round trip.
+
+    The check and the download are ONE at a time: inside a process the callers that
+    find no database share the one flight (and its error, which is not kept); across
+    the processes of the machine a lock file in the geoip root holds the others, who
+    then re-read what the first left (the database, the time of its check) and reuse it.
 
     Resolution order:
       1. ``STEALTHFOX_GEOIP_MMDB`` env → use that file (user-supplied / test).
-      2. Resolve the CURRENT latest tag. If it differs from the newest cached
+      2. A database is cached and the last check is recent (or this process
+         already checked) → use it, nothing is asked.
+      3. Resolve the CURRENT latest tag. If it differs from the newest cached
          tag (or nothing is cached) → download it, prune older tags, return it.
-      3. Latest tag == newest cached tag → use the cache (no download).
-      4. Couldn't resolve the tag (offline / unparseable): cached mmdb → use it;
-         cold cache → raise (caller can then drop timezone="auto").
+      4. Latest tag == newest cached tag → use the cache (no download).
+      5. Couldn't resolve the tag (offline / unparseable): cached mmdb → use it,
+         without an error; cold cache → raise (caller can then drop
+         timezone="auto"). A failed check is not kept: the next process asks.
     """
     override = os.environ.get(environment.GEOIP_MMDB)
     if override:
@@ -215,9 +357,45 @@ def ensure_geoip_mmdb() -> Path:
             raise RuntimeError(f"STEALTHFOX_GEOIP_MMDB points to a missing file: {p}")
         return p
 
-    cached = _cached_geoip_mmdb()
-    cached_tag = cached.parent.name if cached else None
+    global _flight, _CHECKED_THIS_PROCESS
+    with _flight_lock:
+        cached = _cached_geoip_mmdb()
+        if _flight is not None:
+            if cached:
+                return cached  # a refresh is in flight and there is a database to use meanwhile: nobody waits for it
+            flight, leader = _flight, False  # a cold cache: the callers share the one download, and its error
+        else:
+            if cached and not _check_is_due():
+                return cached  # checked recently, or already by this process: GitHub is not asked
+            _CHECKED_THIS_PROCESS = True
+            flight = _flight = _Flight()
+            leader = True
+    if not leader:
+        return flight.wait()
+    try:
+        flight.result = _check_and_fetch()
+        return flight.result
+    except BaseException as exc:
+        flight.error = exc  # not kept: the flight ends here and the next call starts its own
+        raise
+    finally:
+        with _flight_lock:
+            _flight = None
+        flight.done.set()
 
+
+def _check_and_fetch() -> Path:
+    """The check and the download, one process of the machine at a time: whoever got the lock after another one finished re-reads what that one left
+    (the database, the time of its check) before deciding that anything is to be asked or fetched."""
+    with _machine_lock():
+        cached = _cached_geoip_mmdb()
+        if cached and not _state_is_due():
+            return cached  # another process checked (and fetched) while this one waited
+        return _check_and_fetch_locked(cached)
+
+
+def _check_and_fetch_locked(cached: Path | None) -> Path:
+    cached_tag = cached.parent.name if cached else None
     latest = _resolve_latest_geoip_tag()
     if latest and latest != cached_tag:
         # newer build available (or nothing cached) → fetch it.
@@ -234,14 +412,23 @@ def ensure_geoip_mmdb() -> Path:
         try:
             mmdb = _download_geoip_tag(latest, attempts=attempts)
             _prune_old_geoip_tags(mmdb.parent.name)
+            _record_check()
             return mmdb
         except Exception:
             if cached:
-                return cached  # transient download failure → keep using the cache
+                # transient download failure → keep using the cache. Listed AGAIN: another process may have pruned or replaced the tag
+                # directory while this one was asking GitHub, and the path read before the check may be gone.
+                still = _cached_geoip_mmdb()
+                if still:
+                    return still
             raise
 
-    if cached:
-        return cached  # cache is already the latest, or we're offline
+    if latest:
+        _record_check()  # GitHub answered and the cache is the latest
+    # The cache is listed AGAIN after the check, for the same reason as above: the path read before it may have been pruned by another process.
+    still = _cached_geoip_mmdb() if cached else None
+    if still:
+        return still  # cache is already the latest, or we're offline
 
     raise RuntimeError(
         "geoip mmdb unavailable: no cached copy and GitHub is unreachable. "

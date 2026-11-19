@@ -62,7 +62,7 @@ def _hang_all(monkeypatch, clock, *, cost: float):
         clock.now += min(_real_cost(timeout), cost)
         raise OSError("timed out")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     return seen
 
 
@@ -141,7 +141,7 @@ def test_a_fast_success_still_returns_on_the_first_endpoint(monkeypatch, clock):
         clock.now += 0.05
         return _Resp()
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     assert _geo.discover_egress_ip(timeout=10.0, budget=15.0) == "203.0.113.7"
     assert len(calls) == 1, "a success must not keep trying the other endpoints"
 
@@ -164,7 +164,7 @@ def test_a_later_endpoint_still_wins_inside_the_budget(monkeypatch, clock):
             raise OSError("connection refused")
         return _Resp()
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     assert _geo.discover_egress_ip(timeout=10.0, budget=15.0) == "198.51.100.9"
     assert state["n"] == 2
 

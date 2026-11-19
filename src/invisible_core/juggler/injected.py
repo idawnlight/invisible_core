@@ -43,7 +43,8 @@ from __future__ import annotations
 
 import json
 import pathlib
-import time
+import threading
+from collections import OrderedDict
 from typing import Any, Optional
 
 from .connection import ProtocolError, ReplyTimeout
@@ -64,6 +65,22 @@ _SOURCE = pathlib.Path(__file__).with_name("injected.js")
 
 class EvaluationError(RuntimeError):
     """The JavaScript raised. Carries the PAGE's text and stack."""
+
+
+class FrameDetached(RuntimeError):
+    """The frame a command was aimed at left the page: its iframe element was removed, or its process ended.
+
+    The text is Playwright's own, "Frame was detached", and so is the way it ends a call: at once. A frame that
+    left has no next world, so a wait for one can only run out its bound; this ends it at the detach instead.
+
+    ⛔ NOT A `ContextDestroyed`, AND THAT IS THE POINT. `ContextDestroyed` says the frame's world went and the
+    frame's NEXT world is worth waiting for (`in_current_world` asks again); a detached frame has none, so this one
+    is final and nothing asks again."""
+
+
+#: How many detached frame ids are remembered. A frame id is unique for the life of the page, so the set only
+#: has to hold the ids a call can still be aimed at; the oldest go first.
+_GONE_LIMIT = 4096
 
 
 class ContextDestroyed(RuntimeError):
@@ -170,6 +187,13 @@ class InjectedScript:
         self.session = session
         #: (frameId, worldName) -> executionContextId
         self.contexts: dict = {}
+        #: Notified when a context is born: a wait for a frame's world sleeps
+        #: on it until the event that makes the world, not in turns.
+        self._contexts_changed = threading.Condition()
+        #: The frames the engine said are detached (`Page.frameDetached`), oldest first, until announced again.
+        #: Guarded by `_contexts_changed`, which a detach notifies: a wait for a world of a frame that left ends
+        #: on it (`_world`).
+        self._gone: "OrderedDict[str, None]" = OrderedDict()
         #: frameId -> (executionContextId it was built in, objectId)
         #:
         #: ⛔ THE CONTEXT IS PART OF THE KEY, AND IT IS NOT BOOKKEEPING: it is
@@ -203,6 +227,10 @@ class InjectedScript:
         #: here because this object is the one that owns the engine's init
         #: script list - see `_push_scripts`.
         self._init_scripts: list = []
+        #: Held while the list changes AND while it is sent: the command
+        #: replaces the engine's list, so two changes sent in the other order
+        #: would leave the engine with the first one's list.
+        self._scripts_lock = threading.Lock()
         # ⛔ Registered on the connection's list, never chained onto whoever
         # was there before: see the note in `Connection._listeners`.
         connection.add_listener(self._route)
@@ -216,11 +244,33 @@ class InjectedScript:
         """Stop listening. Called when the page this belongs to goes away."""
         self.c.remove_listener(self._route)
 
+    def _on_frame_detached(self, frame_id: Optional[str]) -> None:
+        """The frame left: what this holds of it goes, and every wait for one of its worlds ends."""
+        if frame_id is None:
+            return
+        with self._contexts_changed:
+            self._gone[frame_id] = None
+            self._gone.move_to_end(frame_id)
+            while len(self._gone) > _GONE_LIMIT:
+                self._gone.popitem(last=False)
+            for key in [k for k in self.contexts if k[0] == frame_id]:
+                self.contexts.pop(key, None)
+            self._contexts_changed.notify_all()
+        self._handle.pop(frame_id, None)
+
     def _on_event(self, method: str, p: dict) -> None:
         if method == "Runtime.executionContextCreated":
             aux = p.get("auxData") or {}
-            self.contexts[(aux.get("frameId"), aux.get("name") or "")] = \
-                p["executionContextId"]
+            with self._contexts_changed:
+                self.contexts[(aux.get("frameId"), aux.get("name") or "")] = \
+                    p["executionContextId"]
+                self._contexts_changed.notify_all()
+        elif method == "Page.frameAttached":
+            # The same id announced again (the iframe of a crashed process navigates anew) is a frame again.
+            with self._contexts_changed:
+                self._gone.pop(p.get("frameId"), None)
+        elif method == "Page.frameDetached":
+            self._on_frame_detached(p.get("frameId"))
         elif method == "Runtime.executionContextDestroyed":
             dead = p["executionContextId"]
             for k in [k for k, v in self.contexts.items() if v == dead]:
@@ -254,7 +304,8 @@ class InjectedScript:
         """Creates the utility world. An EMPTY script is enough: what
         matters is the `worldName`, which is the only thing that makes
         the context come into being."""
-        self._push_scripts()
+        with self._scripts_lock:
+            self._push_scripts()
 
     def _push_scripts(self) -> None:
         """Send the WHOLE list, because the command replaces it.
@@ -285,8 +336,9 @@ class InjectedScript:
         would run it behind the Xray, where the page cannot see anything it
         defines, and the call would succeed while doing nothing observable.
         """
-        self._init_scripts.append(source)
-        self._push_scripts()
+        with self._scripts_lock:
+            self._init_scripts.append(source)
+            self._push_scripts()
 
     def remove_init_script(self, source: str) -> None:
         """Undo one. Removes ONE occurrence, not every copy.
@@ -294,9 +346,10 @@ class InjectedScript:
         ⛔ The same source added twice is two scripts by Playwright's
         contract, and disposing one handle must leave the other alive.
         """
-        if source in self._init_scripts:
-            self._init_scripts.remove(source)
-            self._push_scripts()
+        with self._scripts_lock:
+            if source in self._init_scripts:
+                self._init_scripts.remove(source)
+                self._push_scripts()
 
     def _send_in(self, method: str, params: dict, *,
                  timeout: Optional[float]) -> Any:
@@ -364,18 +417,38 @@ class InjectedScript:
                     raise
 
     def context_id(self, frame_id: str, *, timeout: Optional[float] = 10.0) -> str:
-        key = (frame_id, UTILITY_WORLD)
-        deadline = Deadline(timeout)
-        while key not in self.contexts:
-            if deadline.passed():
-                worlds = sorted(n for f, n in self.contexts if f == frame_id)
-                raise TimeoutError(
-                    "the utility world (%s) has not been born for frame "
-                    "%s in %.0fs. Worlds seen for that frame: %s. Did "
-                    "you call install()?" % (UTILITY_WORLD, frame_id,
-                                             timeout, worlds or "none"))
-            time.sleep(0.01)
-        return self.contexts[key]
+        context = self._world(frame_id, UTILITY_WORLD, Deadline(timeout))
+        if context is None:
+            worlds = sorted(n for f, n in self.contexts if f == frame_id)
+            raise TimeoutError(
+                "the utility world (%s) has not been born for frame "
+                "%s in %.0fs. Worlds seen for that frame: %s. Did "
+                "you call install()?" % (UTILITY_WORLD, frame_id,
+                                         timeout, worlds or "none"))
+        return context
+
+    def _world(self, frame_id: str, world: str, deadline: Deadline) -> Any:
+        """The context of `world` in `frame_id`, once the engine has made it;
+        None when the deadline passes first. Woken by the creation event, not
+        polled.
+
+        ⛔ A FRAME THAT LEFT HAS NO WORLD COMING, so the wait ends with
+        `FrameDetached` at the detach, whether the detach came before the wait
+        began or while it slept. It used to run out its whole bound (10 s) and
+        answer "has not been born ... Worlds seen for that frame: none": a click
+        aimed at an iframe that its page removed a moment later read the world,
+        found it destroyed and waited for the next one of a frame that was gone."""
+        key = (frame_id, world)
+        with self._contexts_changed:
+            while True:
+                if frame_id in self._gone:
+                    raise FrameDetached("Frame was detached: %s is not attached "
+                                        "to the page" % frame_id)
+                if key in self.contexts:
+                    return self.contexts[key]
+                if deadline.passed():
+                    return None
+                self._contexts_changed.wait(deadline.left())
 
     # ── evaluation ──────────────────────────────────────────────────────────
     def _result(self, response: dict) -> dict:
@@ -633,52 +706,48 @@ class InjectedScript:
                 ids.append(object_id)
         return ids
 
-    def scroll_into_view(self, frame_id: str, element: str) -> bool:
-        """Bring the element into the viewport, and say whether it moved.
+    def scroll_into_view(self, frame_id: str, element: str,
+                         rect: Optional[dict] = None) -> None:
+        """Bring the element into the viewport, or `rect` of it ({x, y,
+        width, height} in the element's own box: a point is a rect of size 0).
 
-        ⛔ IT WAS MISSING, AND THAT IS WHY A CLICK BELOW THE FOLD FAILED. The
-        retry loop asked whether the element was visible, stable and enabled -
-        all true for something 3000 px down the page - then computed its point
-        from `getContentQuads`, which answers in main-frame coordinates. The
-        event was dispatched at a y outside the viewport, landed on nothing,
-        and the hit-target check reported `<html>` several hundred times before
-        the deadline. Playwright scrolls as part of actionability; we did not.
-
-        ⛔ `scrollIntoView`, called FROM THE UTILITY WORLD. Scrolling is
-        page-visible by construction - a real user scrolls - so there is
-        nothing to hide here; what the world buys is that the call goes to the
-        NATIVE method through the Xray rather than to whatever the site may
-        have replaced it with.
-
-        ⛔ `block: "center"` rather than the default `"start"`: an element
-        flush against the top edge is a point that a sticky header covers on a
-        great many pages, and the interceptor would then correctly report that
-        the event lands elsewhere.
+        The engine's `Page.scrollIntoViewIfNeeded` (firefox-58): the page's
+        own `scrollIntoView`, reached through the Xray so a site that replaced
+        it changes nothing, only when the element or the rect is not in full
+        view in its frame and every frame above, and centred, so a sticky
+        header does not cover the point. A click on an element already in view
+        moves nothing, as in a real browser. Until firefox-58 the command
+        failed on every node and this was a script injected into the page;
+        that script, and the dropped `rect`, are gone.
         """
-        return bool(self.call(
-            frame_id,
-            "(injected, el) => {"
-            " const before = el.getBoundingClientRect().top;"
-            " el.scrollIntoView({block: 'center', inline: 'center',"
-            "                    behavior: 'instant'});"
-            " return el.getBoundingClientRect().top !== before; }",
-            {"objectId": element}))
+        params = {"frameId": frame_id, "objectId": element}
+        if rect is not None:
+            params["rect"] = rect
+        self.c.send("Page.scrollIntoViewIfNeeded", params,
+                    session=self.session)
 
-    def content_origin(self, frame_id: str) -> dict:
-        """Where this frame's content area starts, in SCREEN css pixels.
+    def frame_origin(self, frame_id: str) -> dict:
+        """Where this frame's viewport starts, in the css pixels of the MAIN
+        frame's viewport: `{"x": ..., "y": ...}`.
 
-        ⛔ IT COMES FROM THE ENGINE, and that is the whole point. The hit
-        point a caller has is in the MAIN frame's space, because that is what
-        `Page.getContentQuads` answers and what `dispatchMouseEvent` wants. To
-        check it inside a nested frame it has to be expressed in THAT frame's
-        space, and the difference between the two origins is exactly the shift.
-        Reading it from `mozInnerScreen*` keeps one source: this project already
-        owns that value in C++ (`StealthDeclaredContentOrigin`), so a second
-        arithmetic here would be the duplicate that rule 16 is about.
+        ⛔ IT COMES FROM THE ENGINE, and from its boxes, not from the page.
+        The hit point a caller has is in the MAIN frame's space, because that
+        is what `Page.getContentQuads` answers and what `dispatchMouseEvent`
+        wants. To check it inside a nested frame it has to be expressed in THAT
+        frame's space, and the shift is where the frame starts.
+
+        It used to be the difference of `window.mozInnerScreenX/Y` of the main
+        frame and of the frame. That is only true inside one process. A frame
+        in another process (Fission) has a widget of its own, at the origin of
+        the window like the top's, so both read the same, the difference was
+        zero and the child was asked about the main frame's coordinate: it
+        answered `<html>`, for every click on an element of such a frame. The
+        engine carries the origin up one `<iframe>` at a time, the way it
+        carries the quads of a node, so the shift is right at any depth and
+        across any number of processes.
         """
-        return self.evaluate(
-            frame_id,
-            "({x: window.mozInnerScreenX, y: window.mozInnerScreenY})")
+        return self.c.send("Page.getFrameOrigin", {"frameId": frame_id},
+                           session=self.session, timeout=None)
 
     def check_hit_target(self, frame_id: str, element: str, point) -> str:
         """Does `point` still belong to `element`? `"done"`, or what is there.
@@ -1002,17 +1071,14 @@ class InjectedScript:
         caller's code ran in the page's own context, the one with the empty
         name; nothing here asks for that one any more.
         """
-        deadline = Deadline(timeout)
-        key = (frame_id, CALLER_WORLD)
-        while key not in self.contexts:
-            if deadline.passed():
-                raise TimeoutError(
-                    "the caller's world never appeared for frame %s - did "
-                    "you call install()? Worlds seen: %s"
-                    % (frame_id, sorted(n for f, n in self.contexts
-                                        if f == frame_id)))
-            time.sleep(0.01)
-        return self.contexts[key]
+        context = self._world(frame_id, CALLER_WORLD, Deadline(timeout))
+        if context is None:
+            raise TimeoutError(
+                "the caller's world never appeared for frame %s - did "
+                "you call install()? Worlds seen: %s"
+                % (frame_id, sorted(n for f, n in self.contexts
+                                    if f == frame_id)))
+        return context
 
     def evaluate_raw(self, context_id: str, expression: str, *,
                      by_value: bool = False,

@@ -37,6 +37,8 @@ import threading
 from typing import Any, Callable, Dict, List, Optional
 
 from invisible_core import SessionLocale, parse_proxy
+from invisible_core._offloop import off_the_loop
+from invisible_core._udp_exit import context_proxy_command, launch_proxy_command
 
 from invisible_core.juggler import connection
 from invisible_core import write_user_js
@@ -134,8 +136,13 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
            env: Optional[Dict[str, str]] = None,
            args: Optional[List[str]] = None, headless: bool = True,
            proxy: Optional[Dict[str, str]] = None,
-           ready_timeout: Optional[float] = 60.0) -> "Browser":
+           ready_timeout: Optional[float] = 60.0,
+           udp_stun_servers: Optional[List[str]] = None) -> "Browser":
     """Start the patched Firefox and hand back a `Browser` ready to open pages.
+
+    `udp_stun_servers` (`"ip:port"` IPv4 literals; None = the two public defaults) is where a SOCKS5 proxy's UDP exit
+    is measured from, for the session's proxy and for every context proxy it is later given. It is a parameter of
+    this Python call alone: nothing of it reaches the browser's environment, argv, prefs or pipe.
 
     `env` is the WHOLE environment the browser gets, or None to inherit this
     process's. ⛔ A given environment is not a patch on top of `os.environ`:
@@ -162,13 +169,19 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
         # would write a session identifier onto disk for no reader at all.
         browser_prefs, session_seed, motion_budget_s = take_session_motion(
             prefs or {})
+        # The persona's keyboards, out of the prefs like the seed: declared by
+        # `prefs._apply_locale`; from the language alone when a caller wrote
+        # its prefs without it.
+        from .keyboard import KEYBOARD_LAYOUT_PREF, profiles_pref
+        layout = browser_prefs.pop(KEYBOARD_LAYOUT_PREF, None) or profiles_pref(
+            browser_prefs.get("intl.accept_languages") or "")
         write_user_js(files.profile, browser_prefs)
         # ⛔ PARSED BEFORE THE BROWSER STARTS, so a proxy we cannot express
         # refuses the launch instead of leaving a process running without one.
         proxy_command = None
         if proxy:
             try:
-                proxy_command = parse_proxy(proxy).as_engine_command()
+                proxy_command = launch_proxy_command(proxy, udp_stun_servers)
             except ValueError as exc:
                 raise EngineError("the proxy cannot be applied: %s" % exc)
         # ⛔ THE PROXY IS SET BY THE CORE'S `launch`, before any page exists,
@@ -184,7 +197,8 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
                                  headless=bool(headless), env=files.env,
                                  argv_extra=list(args or []),
                                  ready_timeout=ready_timeout,
-                                 proxy=proxy_command)
+                                 proxy=proxy_command,
+                                 locale=browser_prefs.get("intl.locale.requested"))
     except connection.ReplyTimeout:
         files.remove()
         raise
@@ -199,7 +213,8 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
     try:
         return Browser(conn, read_version(executable),
                        session_seed=session_seed,
-                       motion_budget_s=motion_budget_s, files=files)
+                       motion_budget_s=motion_budget_s, files=files,
+                       layout=layout, udp_stun_servers=udp_stun_servers)
     except BaseException:
         conn.close()
         files.remove()
@@ -252,8 +267,12 @@ class Browser:
 
     def __init__(self, conn: Any, version: str, *, session_seed: Any = None,
                  motion_budget_s: Any = None,
-                 files: Optional[SessionFiles] = None) -> None:
+                 files: Optional[SessionFiles] = None,
+                 layout: str = "us",
+                 udp_stun_servers: Optional[List[str]] = None) -> None:
         self.conn = conn
+        #: Where a context proxy's UDP exit is measured from (the launch's `udp_stun_servers`; None = the defaults).
+        self.udp_stun_servers = udp_stun_servers
         self.version = version
         #: ⛔ THE SESSION'S SEED, and the reason it lives on the BROWSER rather
         #: than on a module: a process can hold two sessions with two seeds,
@@ -263,6 +282,10 @@ class Browser:
         #: downstream reads that as "no rhythm" rather than as a default one.
         self.session_seed = session_seed
         self.motion_budget_s = motion_budget_s
+        #: The persona's keyboards (`keyboard.layouts_for`, KLIDs joined by
+        #: commas), which every page's hands type on. Until 58.55.0 a page made
+        #: here typed on the US keyboard whatever the persona's language.
+        self.layout = layout
         #: Every page of the session gets the next number, and its acts are
         #: numbered from it (`PageActs`): two tabs never draw the same click,
         #: field or typed string. The Playwright wrapper numbers its pages the
@@ -274,6 +297,10 @@ class Browser:
         self._files = files
         self._closed = False
         self._sessions: Dict[str, str] = {}
+        #: Targets that have detached: a wait for the session of one of them
+        #: ends with TargetClosedError instead of waiting for an attach that
+        #: cannot come (a tab the site opened and closed at once).
+        self._detached: set = set()
         #: targetId -> the engine's `targetInfo` (its context, its opener).
         #: ⛔ KEPT FOR EVERY TARGET, not only for the pages this process asked
         #: for: a link with `target=_blank` or a `window.open()` makes a tab
@@ -338,6 +365,7 @@ class Browser:
             with self._sessions_ready:
                 self._sessions.pop(target_id, None)
                 self._targets.pop(target_id, None)
+                self._detached.add(target_id)
                 self._sessions_ready.notify_all()
             # ⛔ AND ITS `Page` IS RETIRED HERE, whoever closed it. Until
             # 41.39.0 only `Page.close()` retired one, so a tab the site
@@ -400,6 +428,10 @@ class Browser:
         deadline = Deadline(timeout)
         with self._sessions_ready:
             while target_id not in self._sessions:
+                if target_id in self._detached:
+                    raise connection.TargetClosedError(
+                        "target %s detached before its session was taken"
+                        % target_id)
                 if self._conn_gone:
                     raise connection.TargetClosedError(
                         "the browser closed before a session attached for "
@@ -491,7 +523,10 @@ class Browser:
         # expressed must not come back usable.
         if options.get("proxy"):
             try:
-                proxy = parse_proxy(options["proxy"]).as_engine_command()
+                # ⛔ MEASURED BEFORE IT IS SENT: a SOCKS5 proxy's UDP exit travels in this very command (`udp`),
+                # and without it the engine drops the UDP of every SOCKS5 proxy. The STUN servers are the launch's.
+                proxy = context_proxy_command(
+                    options["proxy"], getattr(self, "udp_stun_servers", None))
             except ValueError as exc:
                 raise EngineError(
                     "the context proxy cannot be applied: %s" % exc)
@@ -524,6 +559,16 @@ class Browser:
             self.context_send("Browser.setBypassCSP",
                               {"browserContextId": context_id,
                                "bypassCSP": True})
+        # Downloads are opt-in in the engine: Juggler intercepts one only when
+        # the context has download options ({behavior: saveToDisk|cancel,
+        # downloadsDir}). Given here they hold from the context's first page;
+        # a second command after the context exists left a window in which
+        # Firefox's own handling ran.
+        downloads = options.get("downloadOptions")
+        if downloads:
+            self.context_send("Browser.setDownloadOptions",
+                              {"browserContextId": context_id,
+                               "downloadOptions": downloads})
         # ⛔ Inverted on purpose: the option says `javaScriptEnabled=False`,
         # Juggler says `javaScriptDisabled=True`. Passing one straight into the
         # other would turn scripting OFF for every default context, which is
@@ -582,8 +627,17 @@ class Browser:
         ⛔ THE ORDER IS THE POINT. The browser holds a lock on its profile
         until it is gone, and removing the directory first fails on Windows -
         silently, because a removal must never raise. And the browser is not
-        the last process: `SessionFiles.remove` ends the children that outlive
+        the last process: the launch's reaper ends the children that outlive
         it before it removes anything (B223).
+
+        ⛔ IT RETURNS WHEN THE BROWSER HAS EXITED, not when its sender of the
+        shutdown pings has: that process leaves by itself within a second and
+        nobody who closed a browser is waiting for it. The reaper (a thread
+        that is not a daemon, `Connection.reaper`) waits for it, ends it only
+        after the grace of `SessionFiles`, and then takes the directories
+        away; the end of the interpreter waits for it too. `wait_reaped()` is
+        the wait for all of it, for a caller that wants the guarantee at a
+        point of its own.
 
         Idempotent: an adapter may reach this from more than one way out.
         """
@@ -594,8 +648,37 @@ class Browser:
             self.conn.close()
         except Exception:
             pass
-        if self._files is not None:
+        if self._files is None:
+            return
+        reaper = getattr(self.conn, "reaper", None)
+        if reaper is None:               # a connection with no tree of its own: nothing to wait for
             self._files.remove()
+        else:
+            reaper.then(self._files.remove)
+
+    async def aclose(self) -> None:
+        """`close()` for an event loop: the wait for the browser's exit runs in a
+        thread of its own, and the loop goes on serving whatever else it serves
+        (other browsers of this process, among them). It returns when `close()`
+        has: the browser has exited; the rest is the reaper's
+        (`await_reaped()`)."""
+        await off_the_loop(self.close)
+
+    def wait_reaped(self, timeout: Optional[float] = None) -> bool:
+        """Waits for everything that follows the browser's exit: the processes
+        that outlive it have finished or been ended, the launch is released and
+        the session's directories are gone. True when it is all done, False at
+        `timeout`. Costs nothing when nothing was left: the wait is on the tree
+        being empty, not on a time. Only after `close()`."""
+        reaper = getattr(self.conn, "reaper", None)
+        if reaper is None:
+            return True
+        reaper.join(timeout)
+        return reaper.finished
+
+    async def await_reaped(self, timeout: Optional[float] = None) -> bool:
+        """`wait_reaped()` for an event loop, in a thread of its own."""
+        return await off_the_loop(self.wait_reaped, timeout)
 
 
 # ── context ─────────────────────────────────────────────────────────────────
@@ -749,11 +832,13 @@ class Page:
                                acts=PageActs(next(browser._page_numbers)),
                                session_seed=browser.session_seed,
                                motion_budget_s=browser.motion_budget_s,
-                               engine_approach=True)
+                               engine_approach=True, layout=browser.layout)
         self._listeners: List[Callable] = []
         self._detached = False
         self.replayed_events = browser.replay(session, conn.dispatch_event)
         self.main_frame_id = self.lifecycle.wait_for_main_frame(timeout=None)
+        # Handed over ready, as Playwright's own page is: the first `goto` cannot meet the page's initial about:blank.
+        self.lifecycle.wait_for_page_ready(timeout=60.0)
 
     @property
     def browser(self) -> Browser:

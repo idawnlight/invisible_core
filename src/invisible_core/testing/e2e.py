@@ -13,10 +13,15 @@ and a display, and they skip themselves when no binary is available. That makes
 them easy to forget. This is the run that takes them all, deliberately, against
 a chosen binary: the mandatory pre-release e2e gate of a firefox-N.
 
-Flake-resilience: under full-suite load a couple of interaction tests (dblclick,
-hover/mouseenter) can flake even though they pass 3/3 in isolation, so failures
-are rerun up to twice on the known transient signatures. A genuinely broken
-binary fails all attempts. The webrtc e2e fake a TCP-only SOCKS locally (no
+NO RERUNS, AND A JUNIT FOR EVERY PASS. A test that fails is red, and its error
+is kept: this run used to pass `--reruns 2` on a list of "transient" messages,
+so a test red at its first attempt turned green at the second and the first
+attempt's error was thrown away (`-v --tb=short` prints only `RERUN`): in the
+wrapper's run 43763144152 two tests were green with no error anywhere to read.
+A test that passes at its second attempt is not green. The command carries no
+rerun option and `-p no:rerunfailures`, so an installed plugin cannot rerun
+either. Each pass writes its own junit (xunit2), the record a failure is read
+from; see `junit_dir`. The webrtc e2e fake a TCP-only SOCKS locally (no
 proxy/secrets), so the whole suite is offline.
 
 The run opens FOUR browsers at once by default. `--dist loadfile` is not
@@ -32,11 +37,19 @@ Usage, through a client's entry:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-__all__ = ["DEADLINE_S", "WALL_CLOCK", "command", "main", "passes", "verdict"]
+__all__ = ["DEADLINE_S", "JUNIT_DIR_ENV", "WALL_CLOCK", "command", "junit_dir",
+           "junit_file", "main", "passes", "verdict"]
+
+#: Where the junit of each pass is written, when the caller says so. Unset, it
+#: goes next to the watchdog log (`INVPW_TEST_WATCHDOG_FILE`), which a client's
+#: workflow already uploads as an artifact and which lives in the runner's temp
+#: directory; with neither, in `e2e-junit/` under the client's checkout.
+JUNIT_DIR_ENV = "INVPW_E2E_JUNIT_DIR"
 
 #: The marker of a test whose VERDICT reads a wall-clock duration: an upper
 #: bound on how long something took, or a ratio of two durations.
@@ -54,8 +67,6 @@ WALL_CLOCK = "wall_clock"
 #: pytest's "no tests were collected". One pass of a run that selected nothing
 #: is not a failure: a client with no `wall_clock` test has an empty second pass.
 _NOTHING_COLLECTED = 5
-
-_RERUN_SIGNATURES = "Timeout|context was destroyed|was detached|not visible|because of a navigation|TargetClosed"
 
 #: Browsers opened at once. Four was asked for and four is what the default is;
 #: it is not a measured optimum and there is no reason to believe one number
@@ -134,10 +145,37 @@ def verdict(codes: list[int]) -> int:
     return next((c for c in ran if c != 0), 0)
 
 
+def junit_dir(repo: Path, env: dict[str, str] | None = None) -> Path:
+    """The directory the junit files of a run are written to: `$INVPW_E2E_JUNIT_DIR`;
+    else the directory of `$INVPW_TEST_WATCHDOG_FILE` (the runner's temp
+    directory in a client's e2e workflow, so `<that directory>/e2e-junit-*.xml`
+    is uploadable beside the watchdog log); else `<repo>/e2e-junit`."""
+    env = os.environ if env is None else env
+    if env.get(JUNIT_DIR_ENV):
+        return Path(env[JUNIT_DIR_ENV])
+    if env.get("INVPW_TEST_WATCHDOG_FILE"):
+        return Path(env["INVPW_TEST_WATCHDOG_FILE"]).parent
+    return Path(repo) / "e2e-junit"
+
+
+def junit_file(directory: Path, selection: str) -> Path:
+    """The junit of the pass that selects ``selection``: one name per pass, so
+    the parallel pass and the `wall_clock` pass never write the same file."""
+    return Path(directory) / ("e2e-junit-%s.xml" % re.sub(r"[^A-Za-z0-9_]+", "-", selection).strip("-"))
+
+
 def command(procs: str, extra: list[str], *,
             selection: str = "e2e",
-            deadline_s: int = DEADLINE_S) -> list[str]:
-    """The pytest command line of one pass of the run."""
+            deadline_s: int = DEADLINE_S,
+            junit: Path | str | None = None) -> list[str]:
+    """The pytest command line of one pass of the run.
+
+    ``junit`` is the file this pass writes its junit to; unset, it is the
+    pass's file in `junit_dir` of the current directory. An `extra` that names
+    its own `--junitxml` comes last and wins, as any later pytest option does.
+    """
+    if junit is None:
+        junit = junit_file(junit_dir(Path.cwd()), selection)
     # ⛔ `--dist loadfile` IS NOT A TUNING CHOICE, IT IS A CORRECTNESS ONE, and
     # xdist's default (`--dist load`, which hands out one test at a time) breaks
     # the wrapper's suite in two measured ways.
@@ -178,18 +216,19 @@ def command(procs: str, extra: list[str], *,
         sys.executable, "-m", "pytest",
         "-m", selection,
         "-o", "addopts=",            # override the default 'not e2e' deselection
-        "--reruns", "2", "--reruns-delay", "1",
-        "--only-rerun", _RERUN_SIGNATURES,
-        # A DEADLINE is not a flake, and retrying one multiplies it by three.
-        # `Timeout` in the signatures above was written for Playwright's
-        # TimeoutError, but it also matches `subprocess.TimeoutExpired` -
-        # measured, 2 tests produced 4 reruns - and the release/upgrade e2e
-        # spend their time in `pip install` calls whose timeouts run to 300s
-        # each. Retried twice that is 900s for one test, and the two files sum
-        # to 10050s of timeout budget against a 2400s job. That is how the job
-        # was killed at 40 minutes twice with nothing to show for it.
-        "--rerun-except", "TimeoutExpired",   # a subprocess deadline
-        "--rerun-except", "Timeout >",        # pytest-timeout's own deadline
+        # ⛔ NOTHING IS RERUN, AND NO PLUGIN MAY. The run used to retry failures
+        # on a list of transient messages; the first attempt's error was thrown
+        # away and a test that passed at its second attempt was reported green
+        # (wrapper run 43763144152: two such tests, no error to read). A test
+        # that passes at its second attempt is not green. `-p no:rerunfailures`
+        # is for the plugin being installed in the environment: without it,
+        # PYTEST_ADDOPTS or an ini file could turn the retries back on.
+        "-p", "no:rerunfailures",
+        # The record of the pass, written whether it is green or red: the error
+        # of every failed test is in it, and a client uploads it as an artifact.
+        # xunit2, because the default family drops the attributes a judge reads.
+        "-o", "junit_family=xunit2",
+        "--junitxml=%s" % junit,
         # And a per-test deadline, so a hang FAILS WITH A NAME instead of eating
         # the job. METHOD=thread, not the signal default: measured 2026-08-13,
         # the suite wedged in `test_hover_triggers_mouseenter` and the 420s
@@ -235,11 +274,12 @@ def main(argv: list[str], repo: Path, *,
     ``argv`` is the entry's own arguments: the binary (or none, for
     $INVPW_BINARY_PATH), `-n`, and anything else, which goes to pytest - to
     EVERY pass, so a `-k` narrows both; an output file named there would be
-    written by each pass in turn.
+    written by each pass in turn (the run's own junit is one file per pass).
     ``deadline_s`` is for this module's own tests, which cannot wait 420 s for
     a test to die.
     """
     procs, extra = _take_procs(argv)
+    junits = junit_dir(repo)
     binary = extra[0] if extra else os.environ.get("INVPW_BINARY_PATH")
     extra = extra[1:] if extra else []
     if not binary:
@@ -281,9 +321,11 @@ def main(argv: list[str], repo: Path, *,
     env["STEALTHFOX_E2E_BINARY"] = binary
 
     print(f"[run_e2e] binary={binary}")
+    print(f"[run_e2e] junit of each pass: {junits}")
     codes = []
     for width, selection in passes(procs):
-        cmd = command(width, extra, selection=selection, deadline_s=deadline_s)
+        cmd = command(width, extra, selection=selection, deadline_s=deadline_s,
+                      junit=junit_file(junits, selection))
         print(f"[run_e2e] -m '{selection}', browsers at once: "
               f"{'1 (serial)' if width in ('0', '1') else width}")
         print(f"[run_e2e] {' '.join(cmd)}", flush=True)

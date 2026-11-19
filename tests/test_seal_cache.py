@@ -65,8 +65,6 @@ def entry_rel() -> str:
 
 
 def resources_of(root: Path) -> Path:
-    if sys.platform == "darwin":
-        return root / "Firefox.app" / "Contents" / "Resources"
     return root
 
 
@@ -91,8 +89,8 @@ def build_tree(root: Path, *, version: str = SEALED_VERSION, build_id: str = SEA
 
 
 def asset_name(version: str) -> str:
-    infix, ext = {"win32": ("win", "zip"), "linux": ("linux", "tar.gz"),
-                  "darwin": ("macos", "tar.gz")}.get(sys.platform, ("linux", "tar.gz"))
+    infix, ext = {"win32": ("win", "zip"), "linux": ("linux", "tar.gz")}.get(
+        sys.platform, ("linux", "tar.gz"))
     return f"firefox-{version}-stealth-{infix}-{normalize_arch(platform.machine())}.{ext}"
 
 
@@ -148,7 +146,7 @@ def no_network(monkeypatch):
     the tests that must not serve a warm tree, and a failure everywhere else."""
     def boom(*a, **k):
         raise NetworkTouched(f"cold path taken: {a[:2]}")
-    monkeypatch.setattr(download, "_resolve_asset_url", boom)
+    monkeypatch.setattr(download, "_resolve_asset_urls", boom)
     monkeypatch.setattr(download, "_download_file", boom)
     return boom
 
@@ -174,15 +172,15 @@ def test_pin_to_another_tag_is_refused_without_touching_the_network(cache, no_ne
 
 # ------------------------------------------------------------------- D3
 
-def test_warm_legacy_tree_from_another_release_is_not_served(cache, no_network, sealed):
-    """D3: the flat cache_root()/<tag> layout every field install has, holding a
-    150.0.1 engine, under a core sealed to 151.0. The half-edit case. It must
-    fall through to the cold path rather than hand the stale engine back."""
+def test_a_flat_tree_is_not_served(cache, no_network, sealed):
+    """D3: the flat cache_root()/<tag> layout older installs have, holding a
+    150.0.1 engine, under a core sealed to 151.0. That layout is not looked at:
+    it falls through to the cold path rather than hand the stale engine back."""
     legacy = cache / "firefox-18"
     build_tree(legacy, version=OLD_VERSION, build_id=OLD_BUILD)
     with pytest.raises(NetworkTouched):
         ensure_binary(seal=sealed)
-    assert (legacy / entry_rel()).exists(), "an unadoptable tree is left in place"
+    assert (legacy / entry_rel()).exists(), "a flat tree is left in place"
 
 
 def test_warm_tree_under_the_content_key_but_from_another_build_is_not_served(
@@ -292,20 +290,20 @@ def test_a_warm_launch_writes_nothing_in_the_engine_store(cache, no_network, sea
 
 # --------------------------------------------------------- adoption and D5
 
-def test_legacy_flat_tree_matching_the_seal_is_adopted_not_re_downloaded(
+def test_a_content_keyed_tree_that_lost_its_stamp_is_adopted_not_re_downloaded(
         cache, no_network, tmp_path):
-    """Migration: the 110 MB tree already on disk is verified, moved onto the
-    content-keyed name and stamped adopted, with zero bytes downloaded."""
-    legacy = cache / "firefox-18"
-    build_tree(legacy)
-    omni_sha = _sha256(resources_of(legacy) / "omni.ja")
+    """The 110 MB tree already on disk under its content key is verified and
+    stamped adopted, with zero bytes downloaded."""
+    version_dir = cache / f"firefox-18_{SEALED_VERSION}_{SEALED_BUILD}"
+    build_tree(version_dir)
+    omni_sha = _sha256(resources_of(version_dir) / "omni.ja")
     seal = load_seal(write_seal(tmp_path / "s.json", omni_sha256=omni_sha))
-    version_dir = cache_dir_for_seal(seal)
+    assert cache_dir_for_seal(seal) == version_dir
+    assert read_stamp(version_dir) is None
 
     got = ensure_binary(seal=seal)
 
     assert got == version_dir / entry_rel(), got
-    assert not legacy.exists(), "the legacy tree is moved, not copied"
     stamp = read_stamp(version_dir)
     assert stamp and stamp.get("adopted") is True, stamp
     assert stamp.get("seal_digest") == seal.digest
@@ -315,12 +313,12 @@ def test_recut_payload_under_the_same_tag_is_not_adopted(cache, no_network, tmp_
     """D5: the tag was re-cut, so the tree on disk is the superseded payload.
     Its omni.ja is not the sealed bytes, so adoption must refuse it instead of
     silently keeping two populations on one reported version."""
-    legacy = cache / "firefox-18"
-    build_tree(legacy)
+    version_dir = cache / f"firefox-18_{SEALED_VERSION}_{SEALED_BUILD}"
+    build_tree(version_dir)
     seal = load_seal(write_seal(tmp_path / "s.json", omni_sha256="ab" * 32))
     with pytest.raises(NetworkTouched):
         ensure_binary(seal=seal)
-    assert (legacy / entry_rel()).exists(), "left in place: it may be the other product's"
+    assert (version_dir / entry_rel()).exists(), "left in place: it is not adopted"
 
 
 # ------------------------------------------------------------------- L7
@@ -364,16 +362,17 @@ def test_clear_cache_without_a_tag_spares_a_longer_tags_tree(cache, sealed, monk
     both do now.
     """
     monkeypatch.setattr(download, "active_seal", lambda: sealed)
-    mine_flat = cache / "firefox-18"
+    flat = cache / "firefox-18"
     mine_keyed = cache / f"firefox-18_{SEALED_VERSION}_{SEALED_BUILD}"
     future = cache / "firefox-180_152.0_20270101000000"
     other = cache / "firefox-1"
-    for d in (mine_flat, mine_keyed, future, other):
+    for d in (flat, mine_keyed, future, other):
         build_tree(d)
 
     removed = sorted(p.name for p in clear_cache())
 
-    assert removed == sorted([mine_flat.name, mine_keyed.name]), removed
+    assert removed == [mine_keyed.name], removed
+    assert flat.exists(), "a flat tree is not the layout this core owns"
     assert future.exists(), "firefox-180 is another release, not this one's cache"
     assert other.exists(), "firefox-1 is another release too"
 
@@ -398,8 +397,8 @@ def test_the_not_adopting_line_names_the_problem(cache, no_network, sealed, caps
     `engine says: Firefox X build Y` line: an observation that reads like a
     success. A user watching a 150.0.1 tree be rejected was told "engine says:
     Firefox 150.0.1 build ..." and nothing about what was wrong with it."""
-    legacy = cache / "firefox-18"
-    build_tree(legacy, version=OLD_VERSION, build_id=OLD_BUILD)
+    version_dir = cache_dir_for_seal(sealed)
+    build_tree(version_dir, version=OLD_VERSION, build_id=OLD_BUILD)
     with pytest.raises(NetworkTouched):
         ensure_binary(seal=sealed)
 
@@ -491,9 +490,9 @@ def test_an_adopted_tree_hands_back_the_real_path(linked_cache, no_network, tmp_
     verify_engine handed back, so a fix inside verify_engine alone would have
     missed it."""
     seen, _real = linked_cache
-    legacy = seen / "firefox-18"
-    build_tree(legacy)
-    omni_sha = _sha256(resources_of(legacy) / "omni.ja")
+    version_dir = seen / f"firefox-18_{SEALED_VERSION}_{SEALED_BUILD}"
+    build_tree(version_dir)
+    omni_sha = _sha256(resources_of(version_dir) / "omni.ja")
     seal = load_seal(write_seal(tmp_path / "s.json", omni_sha256=omni_sha))
     got = ensure_binary(seal=seal)
     assert _is_the_real_path(got), got

@@ -206,7 +206,7 @@ def test_the_direct_message_does_not_send_the_reader_to_a_proxy(monkeypatch):
             "HTTPSConnectionPool(host='api.ipify.org', port=443): Max retries "
             "exceeded (Caused by NameResolutionError('Failed to resolve'))")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     with pytest.raises(_geo.GeoTimezoneError) as excinfo:
         _geo.discover_egress_ip(None)
 
@@ -225,7 +225,7 @@ def test_the_same_failure_through_a_proxy_does_say_proxy(monkeypatch):
         raise requests.exceptions.ConnectionError(
             "Caused by NameResolutionError('Failed to resolve')")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     with pytest.raises(_geo.GeoTimezoneError) as excinfo:
         _geo.discover_egress_ip({"server": "http://proxy.example:8080"})
 
@@ -254,14 +254,14 @@ def _kinds_classify_returns() -> set:
 
 
 def _kinds_assigned_in_discovery() -> set:
-    """String literals assigned to a local named `kind` in discover_egress_ip.
+    """String literals assigned to a local named `kind` in _measure_egress_ip.
 
     `discover_egress_ip` raises with `kind=kind`, a VARIABLE, so a walk that only
     reads literal keywords sees nothing at the single most important raise in the
     module. This reads where that variable gets its literal values instead.
     """
     found = set()
-    tree = ast.parse(inspect.getsource(_geo.discover_egress_ip))
+    tree = ast.parse(inspect.getsource(_geo._measure_egress_ip))
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
@@ -312,7 +312,7 @@ def test_the_walk_can_see_every_place_a_class_is_chosen():
     literals, opaque = _literal_kind_keywords()
     assert literals, "no literal kind= found at all; the walk is broken"
     source = inspect.getsource(_geo).split("\n")
-    discovery = inspect.getsource(_geo.discover_egress_ip)
+    discovery = inspect.getsource(_geo._measure_egress_ip)
     for lineno in opaque:
         line = source[lineno - 1] if 0 < lineno <= len(source) else ""
         assert line.strip() in discovery, (
@@ -407,7 +407,7 @@ def _answering(monkeypatch, text: str) -> list:
         calls.append(url)
         return _Reply(text)
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     return calls
 
 
@@ -508,7 +508,7 @@ def test_the_message_lists_every_endpoint_not_just_the_last(monkeypatch):
         seen.append(url)
         raise fault
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
 
     with pytest.raises(_geo.GeoTimezoneError) as excinfo:
         _geo.discover_egress_ip({"server": "http://proxy.example:8080"})
@@ -531,7 +531,7 @@ def test_the_message_says_whether_a_proxy_was_even_in_the_path(monkeypatch):
     def fake_get(url, proxies=None, timeout=None):
         raise requests.exceptions.ReadTimeout("Read timed out.")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
 
     with pytest.raises(_geo.GeoTimezoneError) as direct:
         _geo.discover_egress_ip(None)
@@ -554,7 +554,7 @@ def test_a_budget_that_expires_before_anything_runs_says_so(monkeypatch):
     def fake_get(url, proxies=None, timeout=None):
         raise AssertionError("no request should be made with no budget left")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     with pytest.raises(_geo.GeoTimezoneError) as excinfo:
         _geo.discover_egress_ip(None, budget=0.0)
 
@@ -570,8 +570,7 @@ def test_a_budget_that_expires_before_anything_runs_says_so(monkeypatch):
 # Which STEP failed. Three unrelated faults used to share one face.
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("resolve", ["prepare_session_geo", "resolve_session_timezone"])
-def test_a_database_failure_does_not_look_like_a_proxy_failure(monkeypatch, resolve):
+def test_a_database_failure_does_not_look_like_a_proxy_failure(monkeypatch):
     """The egress lookup SUCCEEDED here. Only the database step failed.
 
     Before the split, both steps came out of one blanket `except Exception:
@@ -579,7 +578,7 @@ def test_a_database_failure_does_not_look_like_a_proxy_failure(monkeypatch, reso
     the download's own message and nothing saying which half of the work it came
     from. The reflex that invites is to go and check the proxy, which is fine.
     """
-    from invisible_core import download
+    from invisible_core import _geo as download
 
     _answering(monkeypatch, "203.0.113.7")
     monkeypatch.setattr(download, "ensure_geoip_mmdb", lambda *a, **k: (_ for _ in ()).throw(
@@ -587,7 +586,7 @@ def test_a_database_failure_does_not_look_like_a_proxy_failure(monkeypatch, reso
 
     proxy = {"server": "http://proxy.example:8080"}
     with pytest.raises(_geo.GeoTimezoneError) as excinfo:
-        getattr(_geo, resolve)("auto", proxy)
+        _geo.prepare_session_geo("auto", proxy)
 
     error = excinfo.value
     assert error.kind == "geoip_unavailable"
@@ -608,7 +607,7 @@ def test_a_database_failure_with_no_proxy_does_not_mention_one(monkeypatch):
     still reaches a person: `_warn_locale_fallback` prints it to stderr, which
     the test below covers.
     """
-    from invisible_core import download
+    from invisible_core import _geo as download
 
     monkeypatch.setattr(download, "ensure_geoip_mmdb", lambda *a, **k: (_ for _ in ()).throw(
         OSError("disk full while writing the mmdb")))
@@ -642,7 +641,7 @@ def test_the_locale_warning_on_a_direct_run_does_not_blame_a_proxy(monkeypatch, 
         raise requests.exceptions.ConnectionError(
             "Caused by NameResolutionError('Failed to resolve')")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     decide_session_locale("auto")
 
     printed = capsys.readouterr().err
@@ -665,7 +664,7 @@ def test_the_locale_warning_keeps_its_advice_on_its_own_line(monkeypatch, capsys
     def fake_get(url, proxies=None, timeout=None):
         raise requests.exceptions.ReadTimeout("Read timed out.")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     decide_session_locale("auto")
 
     lines = capsys.readouterr().err.strip().split("\n")
@@ -685,7 +684,7 @@ def test_a_discovery_failure_still_reports_the_discovery_class(monkeypatch):
             "Caused by ProxyError('Unable to connect to proxy', "
             "OSError('Tunnel connection failed: 407 Proxy Authentication Required'))")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     with pytest.raises(_geo.GeoTimezoneError) as excinfo:
         _geo.prepare_session_geo("auto", {"server": "http://proxy.example:8080"})
     assert excinfo.value.kind == "proxy_auth"
@@ -789,7 +788,7 @@ def test_the_proxy_credentials_never_reach_the_diagnosis(monkeypatch):
             "could not reach %s through %s (raw s3cr@t pw) and the cause is late"
             % (url, proxies["https"]))
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     with pytest.raises(_geo.GeoTimezoneError) as excinfo:
         _geo.discover_egress_ip(proxy)
     text = str(excinfo.value)

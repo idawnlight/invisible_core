@@ -19,6 +19,12 @@ from __future__ import annotations
 
 import functools
 import sys
+# At import, not inside _iana_zones: zoneinfo reads the stdlib's build data for
+# its search path (sysconfig TZPATH) the first time it is imported, keyed by
+# sys.platform. Imported lazily, it read it under whatever platform a caller had
+# set by then - a test persona of win32 on a Linux runner asked sysconfig for
+# win32's build data and raised ModuleNotFoundError.
+import zoneinfo
 from pathlib import Path
 from typing import Any, Dict, NamedTuple, Optional
 
@@ -26,7 +32,7 @@ from .constants import OSCPU_OVERRIDE, PLATFORM_OVERRIDE, USER_AGENT
 from ._fpforge import Profile
 from ._fpforge.profile import branding_archive, voices_for
 from ._locale import SessionLocale
-from ._webgl_personas import persona_for, render_noise_seed
+from ._webgl_personas import choose_gfx_device, gfx_device_for, persona_for, render_noise_seed
 from ._proxy import configure_proxy
 
 
@@ -72,8 +78,8 @@ _WEBGL1_EXTENSIONS = ",".join([
     "EXT_color_buffer_half_float",
     "EXT_float_blend",
     "EXT_frag_depth",
-    "EXT_sRGB",
     "EXT_shader_texture_lod",
+    "EXT_sRGB",
     "EXT_texture_compression_bptc",
     "EXT_texture_compression_rgtc",
     "EXT_texture_filter_anisotropic",
@@ -168,10 +174,21 @@ _WEBGL2_EXTENSIONS = ",".join([
 #  Verified at the edges: avc1.644000 (level 0) and avc1.64403F (level 6.3)
 #  answer empty on retail, exactly as that function says they must.
 #
-#  ONLY THE DIVERGENT NAMES ARE DECLARED. VP8, VP9, AV1 and the other audio
-#  codecs are bundled with the build, agree cross-OS, and so carry nothing to
-#  declare away. A pref entry that cannot move a measurement is not a safety
-#  margin, it is an untested code path.
+#  ONLY THE DIVERGENT NAMES ARE DECLARED. The other audio codecs are bundled
+#  with the build, agree cross-OS, and so carry nothing to declare away. A pref
+#  entry that cannot move a measurement is not a safety margin, it is an
+#  untested code path.
+#
+#  ⛔ VP8, VP9 AND AV1 WERE ON THAT LIST, AND FIREFOX 159 MOVED THEM OFF IT.
+#  canPlayType agrees cross-OS for them, but the HARDWARE bit does not, and
+#  from 159 a page reads it: decodingInfo({type: "webrtc"}) asks
+#  WebrtcMediaDataDecoder::Supports -> PDMFactory::SupportsAsync, which the
+#  engine hooks with this pref, and powerEfficient is that answer's
+#  HardwareDecode. Undeclared, the bit was the host GPU's. Measured 2026-10-31
+#  on retail Firefox 159 for Windows, headed, 1280x720 at 1 Mbit/s and 30 fps:
+#  VP8, VP9, AV1 and H.264 all [supported, smooth, powerEfficient] = true.
+#  AV1 is declared per identity in `_apply_codecs`, because media.av1.enabled
+#  is: with it off, retail's decoders all answer nothing.
 #
 #  ⛔ AAC IS ONE OF THEM, AND THE MEASUREMENT THAT SAID IT WAS NOT READ TOO
 #  EARLY. The build's ffvpx has no AAC decoder (CONFIG_AAC_DECODER 0), so on
@@ -198,7 +215,22 @@ _WEBGL2_EXTENSIONS = ",".join([
 _WIN_DECODE_SUPPORT = chr(10).join([
     "video/avc|swhw",
     "video/hevc|swhw",
+    "video/vp8|swhw",
+    "video/vp9|swhw",
     "audio/mp4a-latm|sw",
+])
+
+# What retail Windows 159 ENCODES for WebRTC, in decode_support's lines: software
+# only for all four WebRTC video codecs. Before this the engine asked the OpenH264
+# plugin (present or not, depending on whether the profile had downloaded it) and
+# the host's platform encoders. With video/avc declared in both tables the engine
+# also answers the H.264 software gate from them, not from the plugin or the GPU.
+# The engine refuses to start when this is empty (declaration gate).
+_WIN_ENCODE_SUPPORT = chr(10).join([
+    "video/avc|sw",
+    "video/vp8|sw",
+    "video/vp9|sw",
+    "video/av1|sw",
 ])
 
 # ──────────────────────────────────────────────────────────────────────
@@ -233,13 +265,84 @@ _WIN_DECODING_INFO = chr(10).join([
     "video/webm|vp9|110",
 ])
 
+
+# ──────────────────────────────────────────────────────────────────────
+#  The WebGPU adapter
+#
+#  Firefox hands a page the features and limits wgpu reports for the real
+#  adapter: D3D12 on Windows, Vulkan on Linux, and on a Linux machine without a
+#  GPU a CPU adapter with isFallbackAdapter true. Measured 2026-10-31 with
+#  firefox-54 on Linux: isFallbackAdapter true, an extra "clip-distances" and 14
+#  limits away from retail (maxStorageBufferBindingSize 134217728 against
+#  2147483644, minUniformBufferOffsetAlignment 32 against 256, ...).
+#
+#  Retail Firefox 159 for Windows, headed, gave the same 13 features and 35
+#  limits for an RTX 5080, an Intel iGPU and WARP (forceFallbackAdapter) on the
+#  same machine: they are constants of Firefox's D3D12 backend, not of the GPU.
+#  So they are declared once, for every identity with a Direct3D 12 GPU; the
+#  engine adds "core-features-and-limits" itself, as Firefox does. Every Windows
+#  persona has one since the Direct3D 10 class slots left the pool (2026-11-01).
+# ──────────────────────────────────────────────────────────────────────
+_WIN_WEBGPU_FEATURES = chr(10).join([
+    "bgra8unorm-storage",
+    "depth-clip-control",
+    "depth32float-stencil8",
+    "dual-source-blending",
+    "float32-blendable",
+    "float32-filterable",
+    "indirect-first-instance",
+    "rg11b10ufloat-renderable",
+    "shader-f16",
+    "texture-compression-bc",
+    "texture-compression-bc-sliced-3d",
+    "timestamp-query",
+])
+
+_WIN_WEBGPU_LIMITS = chr(10).join([
+    "maxBindGroups=8",
+    "maxBindGroupsPlusVertexBuffers=24",
+    "maxBindingsPerBindGroup=4294967295",
+    "maxBufferSize=2147483644",
+    "maxColorAttachmentBytesPerSample=128",
+    "maxColorAttachments=8",
+    "maxComputeInvocationsPerWorkgroup=1024",
+    "maxComputeWorkgroupSizeX=1024",
+    "maxComputeWorkgroupSizeY=1024",
+    "maxComputeWorkgroupSizeZ=64",
+    "maxComputeWorkgroupStorageSize=32768",
+    "maxComputeWorkgroupsPerDimension=65535",
+    "maxDynamicStorageBuffersPerPipelineLayout=4",
+    "maxDynamicUniformBuffersPerPipelineLayout=8",
+    "maxInterStageShaderVariables=31",
+    "maxSampledTexturesPerShaderStage=64",
+    "maxSamplersPerShaderStage=64",
+    "maxStorageBufferBindingSize=2147483644",
+    "maxStorageBuffersInFragmentStage=64",
+    "maxStorageBuffersInVertexStage=64",
+    "maxStorageBuffersPerShaderStage=64",
+    "maxStorageTexturesInFragmentStage=64",
+    "maxStorageTexturesInVertexStage=64",
+    "maxStorageTexturesPerShaderStage=64",
+    "maxTextureArrayLayers=2048",
+    "maxTextureDimension1D=16384",
+    "maxTextureDimension2D=16384",
+    "maxTextureDimension3D=2048",
+    "maxUniformBufferBindingSize=65536",
+    "maxUniformBuffersPerShaderStage=64",
+    "maxVertexAttributes=30",
+    "maxVertexBufferArrayStride=2048",
+    "maxVertexBuffers=16",
+    "minStorageBufferOffsetAlignment=32",
+    "minUniformBufferOffsetAlignment=256",
+])
+
 # ──────────────────────────────────────────────────────────────────────
 #  Windows system-font surface
 #
 #  The 20 `ui.font.*` also live in the binary's all.js. That copy was kept
 #  as a floor for a binary launched WITHOUT this package, because Gecko's own
 #  Linux default names "Sans" at 13.3333px, a family that does not exist on
-#  Windows (FpJS Pro tampering=True on 2026-08-07). It is a second source of
+#  Windows (the studied system tampering=True on 2026-08-07). It is a second source of
 #  truth all the same, and it was wrong on the three form-control fonts
 #  (see `_apply_fonts`): it goes with the next engine, and this is the one
 #  source (28-valori-dell-host.md A7).
@@ -276,10 +379,6 @@ _MONOSPACE_LANG_GROUPS = (
 #  Baseline - applied to every session regardless of Profile.
 # ──────────────────────────────────────────────────────────────────────
 
-#: The fork has no default counter endpoint, matching the native default.
-#: A session may provide its own URL through extra_prefs.
-USAGE_PING_URL = ""
-
 _BASELINE: Dict[str, Any] = {
     # Turn off Firefox's own resistFingerprinting; we do our own via patches.
     # The CSS property set a page enumerates has to match retail, and ours was
@@ -306,9 +405,9 @@ _BASELINE: Dict[str, Any] = {
     "privacy.resistFingerprinting.letterboxing": False,
 
     # FF150 fingerprintingProtection - enabled by default (or remotely via
-    # Mozilla webcompat overrides). FP Pro detects the side-effects and
+    # Mozilla webcompat overrides). The studied system detects the side-effects and
     # flips `privacy_settings: true`. On FF146 these were all off → False.
-    # Force off so FP Pro reports privacy_settings:false (matches FF146).
+    # Force off so the studied system reports privacy_settings:false (matches FF146).
     "privacy.fingerprintingProtection":                              False,
     "privacy.fingerprintingProtection.pbmode":                       False,
     "privacy.fingerprintingProtection.remoteOverrides.enabled":      False,
@@ -334,17 +433,11 @@ _BASELINE: Dict[str, Any] = {
     # obfuscate_host_addresses=true → host candidate is `<uuid>.local` mDNS,
     #   exactly like vanilla Firefox (BrowserLeaks "No Leak", Local IP "-").
     #   The mDNS-IPC hang feared on older builds does NOT reproduce on FF150.
-    # The proxy-egress srflx is injected by our C++ (srflx swap §17 + fallback
-    #   §17.B), fed the egress IP via STEALTHFOX_WEBRTC_PUBLIC_IP from
-    #   launcher._build_env (auto-discovered from the proxy).
-    # IPv6: media.peerconnection.ice.disableIPv6 is DEAD on FF150 (read by no
-    #   ICE-gathering code). The real filter is in nICEr (addrs.cpp), and since
-    #   2026-08-25 it reads ONE source: the environment variable
-    #   STEALTHFOX_WEBRTC_DISABLE_IPV6, written by `launch.build_launch_env`,
-    #   the one composer (the wrapper's `_session.build_env` delegates to it).
-    #   The pref `zoom.stealth.webrtc.disable_ipv6` is NOT written any more: the
-    #   native bridge does not read it, and a pref no C++ reads is precisely what
-    #   `test_no_orphan_prefs_in_baseline` forbids emitting.
+    # UDP and the srflx are the ENGINE's: behind a proxy it sends the STUN over the
+    #   SOCKS5 UDP layer and gathers a real srflx; the core proves and declares neither.
+    # The host network (adapter, private address, IPv6 bit) is declared ONCE, in
+    #   STEALTHFOX_WEBRTC_NETWORK (`_webrtc_network`), written by `launch.build_launch_env`.
+    #   media.peerconnection.ice.disableIPv6 is dead on FF150 (read by no ICE code).
     "media.peerconnection.enabled":                       True,
     "media.peerconnection.ice.no_host":                   False,
     "media.peerconnection.ice.default_address_only":      False,
@@ -353,23 +446,32 @@ _BASELINE: Dict[str, Any] = {
     "media.peerconnection.ice.relay_only":                False,
     "media.peerconnection.use_document_iceservers":       True,
 
-    # Proxy - route DNS through SOCKS proxies to avoid local DNS leaks.
-    #
-    # There are TWO prefs and they are not aliases. `nsProtocolProxyService`
-    # reads `socks_remote_dns` into mSOCKS4ProxyRemoteDNS and
-    # `socks5_remote_dns` into mSOCKS5ProxyRemoteDNS, and `SOCKSRemoteDNS()`
-    # picks between them by the negotiated SOCKS version. This project uses
-    # SOCKS5, so the one declared here drove the branch that never runs, and
-    # the branch that DOES run took Firefox's own compiled default.
-    #
-    # That default is `true`, so nothing leaked - which is exactly why it
-    # survived: the safe behaviour was somebody else's default rather than our
-    # declaration. An upstream flip on a rebase, or a proxy that negotiates
-    # SOCKS4, and local DNS resolution comes back with nothing here asserting
-    # otherwise. Both are declared now. Added 2026-08-09.
-    "network.proxy.socks_remote_dns":                     True,
-    "network.proxy.socks5_remote_dns":                    True,
     "network.proxy.failover_direct":                      False,
+    # Parental controls are declared off by the engine's own service; upstream still reads this cached copy once at
+    # start-up, so a profile that cached `true` would resolve names with the system resolver until the cache is rewritten.
+    "network.parental_controls_cached_state":             False,
+
+    # NAMES: the DNS-over-HTTPS PROVIDER is the core's declaration; the STATE is the engine's.
+    #   The engine (Juggler) derives `network.trr.mode` (3 behind a proxy, the default 0 without one),
+    #   `network.trr.exclude-etc-hosts` and `network.trr.excluded-domains` from the proxies it is given (the browser proxy
+    #   and every context proxy), so the core declares none of those three. The provider is one declaration for every
+    #   session: without a proxy the engine never turns TRR on, so these two keys are inert there.
+    #   Why TRR at all: a name THE PAGE chooses (`iceServers`) must not reach the resolver of the machine, and must still
+    #   resolve: the exit decides where it points. Mode 3 sends every lookup to DoH with no fallback to the system
+    #   resolver, and a DoH request is an ordinary channel, so the proxy road the session already has carries it.
+    #   `bootstrapAddr` is the address of the DoH host, so that finding it needs no DNS. 162.159.61.4 is one of the
+    #   addresses `mozilla.cloudflare-dns.com` answered with on 2026-11-11 (172.64.41.4 is the other); it is Cloudflare's
+    #   anycast and the certificate is still checked against the host name. Both are USER values on purpose: Firefox's DoH
+    #   heuristics (`DoHController`) stand down when `network.trr.mode` or `network.trr.uri` has a user value. A caller
+    #   (an e2e with a local DoH) overrides them through `extra_prefs`, which is applied last.
+    "network.trr.uri":                                    "https://mozilla.cloudflare-dns.com/dns-query",
+    "network.trr.bootstrapAddr":                          "162.159.61.4",
+    # Names the DoH service never sends over DoH: `localhost` only (Firefox answers it itself, 127.0.0.1 and ::1, and no
+    # lookup of it reaches the host). Firefox's own list also holds `local`, which would send every `*.local` name of a
+    # proxied session to the HOST's resolver (hosts file, DNS, and on Windows possibly a multicast query on its LAN): a
+    # page that asks for `x.local` would then read the host. Without a proxy no lookup is DoH (mode 0), so the list is
+    # inert and the lookup is native as in retail; with a proxy `*.local` goes to DoH through the proxy like any other name.
+    "network.trr.builtin-excluded-domains":               "localhost",
 
     # TLS ClientHello fingerprint - match stock Firefox byte-for-byte.
     # The Playwright/Juggler Firefox build this binary derives from re-enables
@@ -397,28 +499,69 @@ _BASELINE: Dict[str, Any] = {
     "browser.shell.checkDefaultBrowser":                  False,
     "browser.aboutwelcome.enabled":                       False,
     "browser.startup.upgradeDialog.enabled":              False,
-    # ⛔ `termsofuse.acceptedVersion: 999` USED TO BE HERE, AND IT WAS A DEAD
-    # DECLARATION. Removed 2026-08-19 after measuring it rather than deducing it.
+
+    # ⛔ THE BRAND'S PREFS ARE THE CORE'S, NOT THE BUILD'S. The engine is built
+    # with Mozilla's unofficial branding, whose pref file differs from the
+    # official one in five prefs (the update ones aside, which the engine
+    # carries on Mozilla's lines). The core decides them, like the rest of the
+    # brand: four take the official Firefox's value, read from
+    # browser/branding/official/pref/firefox-branding.js of the engine's
+    # Firefox (tests/test_brand_prefs_are_the_cores.py ties them to it).
+    # `startup.homepage_welcome_url` is the one the core decides otherwise: ""
+    # (the unofficial build's value too). Every launch is a fresh profile, so
+    # the official "about:welcome" would open the first-run welcome tab in
+    # every session - a browser that is always on its first run, which no
+    # person's browser is. `app.releaseNotesURL.prompt` is in the official file
+    # but nothing in Firefox 159 reads it, so declaring it would move nothing.
+    "devtools.selfxss.count":                             0,
+    "app.releaseNotesURL":                                "https://www.firefox.com/%LOCALE%/firefox/%VERSION%/releasenotes/?utm_source=firefox-browser&utm_medium=firefox-desktop&utm_campaign=whatsnew",
+    "app.releaseNotesURL.aboutDialog":                    "https://www.firefox.com/%LOCALE%/firefox/%VERSION%/releasenotes/?utm_source=firefox-browser&utm_medium=firefox-desktop&utm_campaign=about-dialog",
+    "startup.homepage_welcome_url":                       "",
+    # ⛔ THE FIRST RUN'S LAUNCH-ON-LOGIN IS ALREADY DECIDED. 157 added
+    # DefaultLaunchOnLogin: on the first run of an official build it waits for
+    # Nimbus and, where the rollout sets `defaultEnabled`, writes
+    # HKCU\...\CurrentVersion\Run\Mozilla-Firefox-<path hash> with
+    # `firefox.exe -os-autostart`. Every launch here is a first run on a new
+    # profile, so every binary that ever ran registered itself: after the
+    # reboot of 2026-10-28 Windows started all twelve at sign-in: 76 Firefox
+    # processes of builds nobody had asked for. `alreadyApplied` is
+    # Mozilla's own record that the decision was taken, so nothing is waited
+    # for and nothing is written; the user-facing setting
+    # (`windowsLaunchOnLogin.enabled`) keeps its default.
+    "browser.startup.windowsLaunchOnLogin.alreadyApplied": True,
+    # ⛔ THE FIRST RUN'S TERMS OF USE ARE THE CORE'S DECISION: ALREADY ACCEPTED.
+    # Federico, 2026-11-02: the core decides it, and by default nothing appears.
+    # Every launch is a new profile, and on a new profile official Firefox opens
+    # the pre-onboarding modal (the terms of use) over the page: the page has no
+    # focus and gets no mouse event until someone accepts. A person's browser
+    # accepted once, long ago; that is the state declared here, on every host.
     #
-    # It did nothing for two independent reasons, and either one is enough:
-    #  1. it duplicated the upstream default: browser/app/profile/firefox.js
-    #     already declares termsofuse.acceptedVersion as 999 on its own.
-    #  2. on its own it would not have been enough anyway. hasUserAcceptedCurrentTOU
-    #     (TelemetryReportingPolicy.sys.mjs:536) ALSO wants
-    #     termsofuse.acceptedDate to be non-null, and upstream sets it to "0".
-    #     Measured: with the version alone the modal comes up regardless.
+    # Measured on official 159.0, new profile, these lines in user.js
+    # (coord/firstrun/first_run_probe.py, read at 5 s and 70 s):
+    #  - none of them: the modal, page document.hasFocus() false;
+    #  - `browser.preonboarding.enabled` false alone: no modal, but the legacy
+    #    data-reporting flow takes over - a background tab on Mozilla's privacy
+    #    page, or with no first-run URL the data-reporting bar at 60 s, which
+    #    takes 40 px off innerHeight;
+    #  - the two `termsofuse.accepted*`: nothing at all, at 5 s or at 70 s,
+    #    page focused, mouse moves delivered. hasUserAcceptedCurrentTOU
+    #    (TelemetryReportingPolicy.sys.mjs) wants both: a date and a version
+    #    not below termsofuse.minimumVersion (4 in 159, the current one;
+    #    tests/test_first_run_is_declared.py ties the value to the engine's).
+    #    The legacy flow asks the same question first, so it stays quiet too.
+    # `browser.preonboarding.enabled` false is declared as well: the modal is
+    # off by its own switch, not only by an acceptance a newer minimumVersion
+    # could invalidate.
     #
-    # And it is not repairable from here in any case: the prefs in this dict
-    # travel over the protocol and Browser.enable applies them AFTER startup,
-    # while the modal is born with the window. Measured: the same prefs passed as
-    # firefox_user_prefs do not repair it, written into a user.js before launch
-    # they do. The remedy lives in the compiled default of our Firefox:
-    # browser/app/profile/firefox.js, termsofuse.acceptedDate.
-    #
-    # What keeping it cost: on a MOZILLA_OFFICIAL build the terms-of-use modal
-    # covers the viewport and eats EVERY mouse event - focus on BODY, zero
-    # mousedown, zero mousemove - while the keyboard keeps working. This line
-    # looked like it protected us and protected nothing.
+    # They must be in the profile before the window exists, since the modal is
+    # born with it: every launch writes them into user.js (`write_user_js`).
+    # The engine carried the acceptance as a compiled default until now
+    # (STEALTH-HOOK on termsofuse.acceptedVersion/acceptedDate in firefox.js):
+    # with the core declaring it, that is the engine's default no longer
+    # deciding anything.
+    "browser.preonboarding.enabled":                      False,
+    "termsofuse.acceptedVersion":                         4,
+    "termsofuse.acceptedDate":                            "1785573000000",
 
     # ⛔ THE FIVE NEWTAB PREFS WERE REMOVED (2026-08-20), AND IT IS AN OWNER
     # DECISION: "I want the original code back, of the 34mb, put this process
@@ -482,7 +625,7 @@ _BASELINE: Dict[str, Any] = {
     # NOW: that path no longer exists - the three AppConstants.sys.mjs entries,
     # the three DEFINES in toolkit/modules/moz.build and the three
     # --with-*-api-keyfile in the .mozconfig are gone - and the engine's only
-    # reader, `URLFormatter.sys.mjs`, reads these prefs (`stealthDeclaredApiKey`).
+    # reader, `StealthApiKeys.sys.mjs`, reads these prefs (`stealthDeclaredApiKey`).
     #
     # ⛔ AND AN ABSENCE IS REFUSED. With no declaration the engine returns the
     # empty string and logs an error to the console: `checkGoogleSafeBrowsingKey`
@@ -535,18 +678,18 @@ _BASELINE: Dict[str, Any] = {
     #: asked says `prompt`, and ours has never been asked - so the fix for one
     #: tell had quietly introduced a smaller one.
     #:
-    #: Nothing replaces it. The provider URL below is empty, so a call cannot
+    #: Nothing replaces it. The engine ships no network geolocation URL (its
+    #: default is empty on every OS, so the core declares none), so a call cannot
     #: reach the network even if a page makes one, and Playwright grants no
     #: permissions by default, so the call is refused exactly as it is for a
     #: user who dismisses the prompt.
-    "geo.provider.network.url":                           "",
     #: ⛔ `browser.region.network.url` and `browser.region.update.enabled` are
     #: NOT emitted any more - owner decision, 2026-08-17. It is not an
     #: oversight: it is the case where suppressing moves AWAY from retail.
     #:
     #: They are Firefox's REGION service, which has nothing to do with a page's
-    #: geolocation - that one is stopped by the line above, which stays and is
-    #: load-bearing. A standard Firefox asks for the region ONCE per session,
+    #: geolocation - that one is stopped by the engine's empty provider URL, which
+    #: stays and is load-bearing. A standard Firefox asks for the region ONCE per session,
     #: and we were doing it anyway: measured 2026-08-17, the product sends that
     #: request even with the empty pref emitted, while a bare launch with the
     #: same pref zeroes it. So we were shipping a declaration that promised
@@ -581,6 +724,9 @@ _BASELINE: Dict[str, Any] = {
     # pinned engine (tests/test_pref_types.py): it moved nothing.
     "browser.contentblocking.report.lockwise.enabled":    False,
     "browser.contentblocking.report.monitor.enabled":     False,
+    # `dom.private-attribution.submission.enabled` was here: 157 removed the
+    # private attribution service and its pref, so there is nothing left to
+    # turn off (tests/test_pref_types.py against the 157 engine).
 
     "browser.translations.enable":                        False,
 
@@ -631,30 +777,25 @@ _BASELINE: Dict[str, Any] = {
     "network.dns.disablePrefetch":                        True,
     "network.dns.disablePrefetchFromHTTPS":               True,
 
-    # === Fission / site-isolation disabled (FF146 Playwright parity) ===
-    # Force a single content-process model. Three knobs are required in FF150:
-    # upstream Playwright Firefox (FF146-based) only needed fission.autostart=False
-    # because FF146's default isolation strategy was looser. FF150 ships with
-    # fission.webContentIsolationStrategy=1 (IsolateEverything) which still
-    # site-isolates cross-origin iframes into separate `webIsolated` content
-    # processes EVEN WHEN fission.autostart is False. From the parent process's
-    # point of view, those iframes get a Juggler Frame placeholder with no
-    # docShell, no URL, and an execution context that wraps the wrong global,
-    # so frame.evaluate() fails with cross-origin SOP errors and
-    # element_handle.content_frame() returns None.
+    # === Fission: every site in a content process of its own ===
+    # A page is held by one content process per fragment root: the top, and every
+    # frame whose parent is in another process. The Juggler routes every command
+    # to the root that holds the frame (ContentMux), announces the frames from the
+    # parent (FrameLifecycle), and keeps a frame tree per root, so a cross-site
+    # iframe is reached like any other: frame.evaluate(), content_frame(), clicks.
     #
-    # Pinning the strategy to 0 keeps every cross-origin web iframe in the
-    # parent's content process, where the Juggler code paths from the FF146
-    # era expect them. processCount.webIsolated=1 is kept as belt-and-suspenders
-    # in case some path still classifies an origin as webIsolated despite the
-    # strategy change. It costs nothing to leave.
+    # `fission.webContentIsolationStrategy` 1 is IsolateEverything: one remote type
+    # per site, as retail Firefox does on desktop. `fission.autostart` is what
+    # turns Fission on; `fission.autostart.session` is NOT declared here: the
+    # parent writes it itself at startup (nsAppRunner.cpp, after it reads the
+    # first). `dom.ipc.processCount.webIsolated` 4 is the desktop default: the
+    # number of processes one site may use.
     #
-    # See issue #20 + tests/test_cross_origin_iframe.py for the regression
-    # sentinel that catches a future A/B flipping these back.
-    "fission.autostart":                                  False,
-    "fission.autostart.session":                          False,
-    "fission.webContentIsolationStrategy":                0,  # IsolateNothing
-    "dom.ipc.processCount.webIsolated":                   1,
+    # tests/test_fission_strategy1_prefs.py holds these three together; the
+    # wrapper's tests/test_cross_origin_iframe.py holds the behaviour.
+    "fission.autostart":                                  True,
+    "fission.webContentIsolationStrategy":                1,  # IsolateEverything
+    "dom.ipc.processCount.webIsolated":                   4,
 
     # === Uploading a real file, which did not work without this ===
     #
@@ -795,6 +936,20 @@ _BASELINE: Dict[str, Any] = {
     # does nothing - the second translation is paid only where the defect is.
     "zoom.stealth.webgl.shader_output_language":          "essl",
 
+    # `webgl.force-enabled` and `gfx.blacklist.webgl.angle` were here until 2026-11-01: they
+    # kept Mozilla's blocklist from refusing WebGL2 and accelerated ANGLE on a
+    # Microsoft Basic / Hyper-V host adapter. The engine now answers every gfx
+    # feature from zoom.stealth.gfx.feature_status (see _apply_gpu_persona), before
+    # either pref is read, so they would be ignored.
+
+    # Canvas 2D on the CPU (Skia) on every host. Measured 2026-11-01 on official
+    # Firefox 159 for Windows with the GPU process up: accelerated, one control
+    # scene differs from the CPU one in 28% of the bytes at 128 px (max 87) and
+    # 22% at 512 px (max 108), and the accelerated bytes follow the host's GPU;
+    # below 128 px both are identical. Even with the GPU process down the pref at
+    # true still changed 6-122 bytes, so it is declared, not left to the host.
+    "gfx.canvas.accelerated":                             False,
+
     # ⛔ `zoom.stealth.text.*` and not `zoom.stealth.font.*`, and the distinction
     # is not cosmetic: `test_fonts_are_not_configured_via_prefs` in the wrapper
     # demands that NO `zoom.stealth.font.` pref is emitted, because the binary
@@ -834,7 +989,7 @@ _BASELINE: Dict[str, Any] = {
     "zoom.stealth.webgl2.extensions":                     _WEBGL2_EXTENSIONS,
     # WebGL numeric param overrides - kept empty (A/B test 2026-04-22 showed
     # mismatches between the values we shipped and ANGLE's real envelope
-    # raised FP Pro's ML tampering score). Slot kept for future experiments.
+    # raised the studied system's ML tampering score). Slot kept for future experiments.
     "zoom.stealth.webgl.int_params":                      "",
     "zoom.stealth.webgl.int2_params":                     "",
     "zoom.stealth.webgl.shader_precisions":               "",
@@ -868,7 +1023,7 @@ _BASELINE: Dict[str, Any] = {
     "dom.webgpu.enabled":                                 True,
 
     # Audio fingerprint noise OFF. RE 2026-06-22: the per-session OfflineAudioContext
-    # noise (gated by hw_seed) was THE dominant driver of FP Pro tampering_ml on Windows
+    # noise (gated by hw_seed) was THE dominant driver of the studied system's tampering_ml on Windows
     # - b005 Win dropped 0.4349 -> 0.0564 with audio noise alone disabled (canvas_text/
     # emoji unchanged, so they were a red-herring). The audio value is already host-indep
     # AND identical to a real FF's canonical OfflineAudioContext sum, so a fixed (un-noised)
@@ -880,22 +1035,6 @@ _BASELINE: Dict[str, Any] = {
     **_NAVIGATOR_OVERRIDES,
 }
 
-
-# ──────────────────────────────────────────────────────────────────────
-#  Linux-only Xvfb workarounds - the Linux Firefox build under Xvfb
-#  cannot run WebRender (`ConnectToCompositor` retries forever). We
-#  disable WebRender + force WebGL through the GL software path so
-#  webgl_basics / webgl_extensions still report.
-# ──────────────────────────────────────────────────────────────────────
-
-_LINUX_XVFB_WORKAROUNDS: Dict[str, Any] = {
-    "gfx.webrender.all":                       False,
-    # `gfx.webrender.force-disabled` was here and no file of the engine reads
-    # it ([B171], tests/test_pref_types.py). What this table still does is
-    # A12 of 28-valori-dell-host.md, for the canvas phase.
-    "webgl.force-enabled":                     True,
-    # webgl.software-rendering-enabled / webgl.force-layers-readback removed in FF150.
-}
 
 # ──────────────────────────────────────────────────────────────────────
 #  Windows hidden-desktop workarounds - when headless=True on Windows,
@@ -994,7 +1133,11 @@ _WIN_VIRT_DESKTOP_WORKAROUNDS: Dict[str, Any] = {
 #: type is what a page reads with one instanceof, no reference data and no
 #: second machine. MAX_VIEWPORT_DIMS (3386) is deliberately NOT here: the
 #: specification really does make that one an Int32Array.
-_WEBGL_FLOAT_PAIR_ENUMS = ("2928", "33901", "33902")
+#:
+#: DEPTH_RANGE left the pool on 2026-10-31 with every other piece of context
+#: state (tests/test_webgl_pool_declares_constants_only.py): Firefox answers it
+#: from the live context, which a declared value froze.
+_WEBGL_FLOAT_PAIR_ENUMS = ("33901", "33902")
 
 
 def _route_float_pairs(prefs: Dict[str, Any]) -> None:
@@ -1020,21 +1163,72 @@ def _route_float_pairs(prefs: Dict[str, Any]) -> None:
 
 
 
+# Software compositing for every persona, declared by the core, the same on every machine
+# (owner's decision 2026-11-15). The decision is the one official Firefox 159 takes on a
+# Windows machine with no GPU, measured on GitHub windows-2022 (adapter Microsoft Hyper-V
+# Video 0x000b): Direct3D11 compositing and WebRender are blocklisted with
+# FEATURE_FAILURE_VM_VENDOR, and the GPU process stays up (WebGL needs it: gfxPlatform.cpp).
+# Only the compositing features are replaced; WebGL, WebGPU, media and every other feature
+# keep what the persona's real device declares. DIRECT3D_11_LAYERS is the feature behind
+# the "D3D11_COMPOSITING" line of about:support; WEBRENDER_ANGLE_METAL is OK on that runner
+# too, as every device declares it.
+_VM_FAILURE = "FEATURE_FAILURE_VM_VENDOR"
+_SOFTWARE_COMPOSITING_STATUS: Dict[str, str] = {
+    "DIRECT3D_9_LAYERS": "4|" + _VM_FAILURE,
+    "DIRECT3D_10_LAYERS": "4|" + _VM_FAILURE,
+    "DIRECT3D_10_1_LAYERS": "4|" + _VM_FAILURE,
+    "DIRECT3D_11_LAYERS": "4|" + _VM_FAILURE,
+    "GPU_PROCESS": "1",
+    "WEBRENDER": "4|" + _VM_FAILURE,
+    "WEBRENDER_COMPOSITOR": "4|" + _VM_FAILURE,
+    "WEBRENDER_SCISSORED_CACHE_CLEARS": "4|" + _VM_FAILURE,
+    "WEBRENDER_OPTIMIZED_SHADERS": "4|" + _VM_FAILURE,
+    "WEBRENDER_SHADER_CACHE": "4|" + _VM_FAILURE,
+    "WEBRENDER_PARTIAL_PRESENT": "4|" + _VM_FAILURE,
+    "WEBRENDER_DCOMP": "4|" + _VM_FAILURE,
+    "WEBRENDER_ANGLE_METAL": "1",
+    "WEBRENDER_ANGLE_GL": "1",
+    "D3D11_KEYED_MUTEX": "4|" + _VM_FAILURE,
+    "DX_INTEROP2": "4|" + _VM_FAILURE,
+    "CANVAS2D_ACCELERATION": "4|" + _VM_FAILURE,
+    "ACCELERATED_CANVAS2D": "4|" + _VM_FAILURE,
+}
+
+# Windows only: on Linux the compositor is already software (llvmpipe goes to software
+# WebRender through gfx.webrender.reject-software-driver, true on GTK), so no pref there.
+_WIN_SOFTWARE_COMPOSITING_PREFS: Dict[str, Any] = {
+    "gfx.webrender.software":       True,   # STEALTH-HOOK declared software compositing: owner's decision 2026-11-15, same on every machine
+    "gfx.webrender.software.d3d11": False,  # STEALTH-HOOK declared software compositing: owner's decision 2026-11-15, no D3D11 compositor, same on every machine
+}
+
+
+def _declare_software_compositing(table: str) -> str:
+    """The persona's feature table with ONLY the compositing features replaced by the
+    decision official Firefox 159 takes with no GPU. Order, names and every other entry
+    are the device's own."""
+    out = []
+    for entry in table.split(","):
+        name = entry.split("|", 1)[0]
+        out.append("%s|%s" % (name, _SOFTWARE_COMPOSITING_STATUS[name])
+                   if name in _SOFTWARE_COMPOSITING_STATUS else entry)
+    return ",".join(out)
+
+
 def _apply_gpu_persona(prefs: Dict[str, Any], profile: Profile):
     """The validated WebGL persona, and the reason it is applied on every host.
 
     On Linux we spoof to a Windows ANGLE renderer string (profile.gpu.renderer)
     so cross-platform sessions report a consistent Windows GPU identity.
     On Windows/mac, spoofing a renderer string ALONE is unsafe - the ~81
-    getParameter values stay real, so a name<->params hash mismatch FP Pro flags
+    getParameter values stay real, so a name<->params hash mismatch the studied system flags
     (setting GTX 980 over real Arc A750 params scored ~0.70). Instead we apply a
     VALIDATED PERSONA (see _webgl_personas): a {renderer, vendor} whose params are
     the shared ANGLE D3D11 caps (vendor-independent - identical on any host, per the
     ANGLE source) and whose extension list is FORCED below. That is a coherent fake
-    GPU that passes FP Pro host-independently (the host's real GPU never leaks). If no
+    GPU that passes the studied system host-independently (the host's real GPU never leaks). If no
     validated persona exists for the sampled gpu_class yet, fall back to the host-real
     renderer (empty -> native ANGLE; SanitizeRenderer at ClientWebGLContext.cpp:2592).
-    Apply the camoufox-derived real-Firefox GPU persona on EVERY host (Win/Linux/Mac).
+    Apply the telemetry-derived real-Firefox GPU persona on EVERY host (Win/Linux/Mac).
     We must ALWAYS look Windows (rule), and the WebGL override is platform-independent:
     SanitizeRenderer (ClientWebGLContext.cpp) is pure string regex, and the param/extension
     overrides are pref-driven, so the C++ presents the SAME Windows ANGLE GPU regardless of
@@ -1057,7 +1251,7 @@ def _apply_gpu_persona(prefs: Dict[str, Any], profile: Profile):
     if persona:
         # Apply the FULL coherent WebGL override (renderer + vendor + webgl1/webgl2 extensions
         # + ~100 getParameter values + shader-precision formats). Setting ALL of them - not just
-        # the renderer string - keeps renderer<->params coherent (FP Pro cross-checks them); a
+        # the renderer string - keeps renderer<->params coherent (the studied system cross-checks them); a
         # string-only spoof over the host's real params is the old ~0.85 mismatch.
         for _k, _v in persona["prefs"].items():
             if _k == "zoom.stealth.webgl2.enabled":
@@ -1065,9 +1259,27 @@ def _apply_gpu_persona(prefs: Dict[str, Any], profile: Profile):
             else:
                 prefs[_k] = _v
         _route_float_pairs(prefs)
+        # The blocklist outcome of every gfx feature, as official Firefox 159 gives
+        # it for the real device behind the persona's bucket (NAME|STATUS[|failureId]):
+        # the engine answers GetFeatureStatus from it on every host, before the
+        # gfx.blacklist.* prefs and both blocklists, so the host adapter decides nothing.
+        # A Profile made before the device existed carries "": the same draw
+        # generate_profile makes, from the seed.
+        _device = (gfx_device_for(profile.gpu.renderer, profile.gpu.device)
+                   or choose_gfx_device(persona, profile.seed))
+        if not _device:
+            raise ValueError("the persona %r has no real device to declare" % profile.gpu.renderer)
+        prefs["zoom.stealth.gfx.feature_status"] = _declare_software_compositing(
+            _device["feature_status"])
+        if sys.platform == "win32":
+            prefs.update(_WIN_SOFTWARE_COMPOSITING_PREFS)
     else:
-        prefs["zoom.stealth.webgl.renderer"] = ""
-        prefs["zoom.stealth.webgl.vendor"]   = ""
+        # ⛔ This emitted empty renderer and vendor until 2026-11-01, which left
+        # WebGL to the host and its blocklist. The engine refuses to start on an
+        # empty pair (the declaration gate), so the cause is named here instead.
+        raise ValueError(
+            "no validated GPU persona for renderer %r / vendor %r: a session always "
+            "presents one from the pool" % (profile.gpu.renderer, profile.gpu.vendor))
     return persona
 
 
@@ -1295,7 +1507,33 @@ def _apply_codecs(prefs: Dict[str, Any], profile: Profile) -> None:
     # capability on or off, which cannot make a decoder the build does not
     # carry exist - and that is exactly why H.264 stayed divergent while every
     # other codec in a 14-type probe agreed.
-    prefs["zoom.stealth.media.decode_support"] = _WIN_DECODE_SUPPORT
+    # AV1 follows the identity's media.av1.enabled. On, retail Windows answers
+    # software and hardware (2026-10-31). Off, every one of retail's decoders
+    # declines it (AgnosticDecoderModule, WMFDecoderModule), so the set is
+    # empty: "no". Declaring hardware there would contradict the canPlayType
+    # "" the same pref gives.
+    #
+    # Retail's tables on every persona: each GPU name the pool presents covers
+    # generations with and without these decoders (SanitizeRenderer: "GeForce
+    # GTX 980" is every GeForce 900 and later), so the page cannot tell. The
+    # Direct3D 10 class personas, whose renderer said they had no VP8/VP9/AV1
+    # decoder, left the pool on 2026-11-01 and the branch for them with it.
+    prefs["zoom.stealth.media.decode_support"] = chr(10).join([
+        _WIN_DECODE_SUPPORT,
+        "video/av1|" + ("swhw" if profile.codec.av1_enabled else "no"),
+    ])
+    prefs["zoom.stealth.media.encode_support"] = _WIN_ENCODE_SUPPORT
+    # WebRTC drops the hardware bit of VP8 AFTER the declared answer, on GTK
+    # only: AdjustWebrtcDecodeSupportVP8 in MediaDataCodec.cpp, behind this pref,
+    # which exists only in GTK builds and defaults to false there. Windows has
+    # no such step, so the Linux build would answer powerEfficient false where
+    # Windows answers true. True is Windows' behaviour; on a Windows build the
+    # pref does not exist and changes nothing.
+    prefs["media.navigator.mediadatadecoder_vp8_hardware_enabled"] = True
+    # The WebGPU adapter (see _WIN_WEBGPU_FEATURES): every persona has Direct3D 12.
+    prefs["zoom.stealth.webgpu.adapter"] = "d3d12"
+    prefs["zoom.stealth.webgpu.features"] = _WIN_WEBGPU_FEATURES
+    prefs["zoom.stealth.webgpu.limits"] = _WIN_WEBGPU_LIMITS
     prefs["zoom.stealth.media.decoding_info"] = _WIN_DECODING_INFO
 
 
@@ -1340,7 +1578,7 @@ def _apply_fonts(prefs: Dict[str, Any], profile: Profile) -> None:
     answers `font: menu` from its own per-OS defaults, which on Linux name
     "Sans" at 13.3333px - a family that does not exist on Windows, on a build
     whose every other signal says Windows. Measured 2026-08-07, that single
-    disagreement is what drove FpJS Pro to tampering=True on Linux with
+    disagreement is what drove the studied system to tampering=True on Linux with
     Windows clean, same seed and same IP.
 
     ⛔ The 20 `ui.font.*` prefs also ship compiled into the binary's all.js,
@@ -1588,6 +1826,12 @@ def _apply_locale(prefs: Dict[str, Any], locale: SessionLocale) -> None:
     # en-AU build) maps that to "en-US, en", and the session declared en-AU
     # here while navigator.language said en-US.
     prefs["intl.accept_languages"]     = locale.accept_languages
+    # The input profiles Windows installs with this language in this country
+    # (German in Switzerland types on the Swiss keyboard; Russian has English
+    # US too), in Windows' own form: one declaration, read by every client's
+    # keyboard.
+    from .juggler.keyboard import KEYBOARD_LAYOUT_PREF, profiles_pref
+    prefs[KEYBOARD_LAYOUT_PREF] = profiles_pref(list(locale.languages), locale.region)
     # ⛔ NO SECOND COPY OF THE WIRE HEADER. Firefox derives Accept-Language
     # from intl.accept_languages (and from a context's language override) in
     # nsHttpHandler, with the q-values of rust_prepare_accept_languages. Until
@@ -1630,8 +1874,6 @@ def _apply_locale(prefs: Dict[str, Any], locale: SessionLocale) -> None:
 
 @functools.lru_cache(maxsize=1)
 def _iana_zones() -> frozenset:
-    import zoneinfo
-
     return frozenset(zoneinfo.available_timezones())
 
 
@@ -1661,7 +1903,7 @@ def _apply_timezone(prefs: Dict[str, Any], timezone: Optional[str]) -> None:
     # not know to the MACHINE's zone, in silence (js/src/vm/DateTime.cpp,
     # DateTimeInfo::timeZone), and ICU's lookup is exact: "america/phoenix"
     # names no zone. An explicit zone reached this line unchecked until the
-    # firefox-50 pin (resolve_session_timezone returns it as given); one from
+    # firefox-50 pin (prepare_session_geo returns it as given); one from
     # the exit was already checked in _geo.ip_to_timezone. Same spelling test
     # here, the IANA database's own names, and the caller gets the right one.
     if zone not in _iana_zones():
@@ -1686,19 +1928,10 @@ def _apply_render_seed(prefs: Dict[str, Any], profile: Profile) -> None:
     # alias was never declared in the yaml and read by nothing - dropped
     # 2026-06-10. The render-noise seed is DECOUPLED from the identity seed and
     # drawn from a calibrated CLEAN pool: the canvas/WebGL render HASH it drives
-    # is the dominant FP Pro tampering_ml signal, and some hw_seeds yield a
+    # is the studied system's dominant tampering_ml signal, and some hw_seeds yield a
     # "suspicious" render hash. render_noise_seed() maps to the clean pool while
     # keeping per-seed determinism + diversity. See _webgl_personas.
     prefs["zoom.stealth.fpp.hw_seed"] = render_noise_seed(profile.seed)
-
-
-def _apply_webrtc_host_ip(prefs: Dict[str, Any], profile: Profile) -> None:
-    # Synthetic host ICE candidate - injected by C++ when addr_ct==0 (SOCKS5
-    # proxy suppresses all local addresses so Firefox can't gather host cands).
-    # LAN IP is seed-derived so it's consistent per session and looks like a
-    # real home router assignment (192.168.x.x range).
-    _s = profile.seed
-    prefs["zoom.stealth.webrtc.host_ip"] = f"192.168.{(_s >> 8) % 254 + 1}.{_s % 254 + 1}"
 
 
 def _apply_extension_lists(prefs: Dict[str, Any], persona) -> None:
@@ -1717,10 +1950,9 @@ def _apply_extension_lists(prefs: Dict[str, Any], persona) -> None:
 
 def _apply_platform_workarounds(prefs: Dict[str, Any], *, virtual_display: bool) -> None:
     """`setdefault`, deliberately: anything a section above chose already wins."""
-    # Linux Xvfb workarounds (no-op on Windows).
-    if sys.platform.startswith("linux"):
-        for k, v in _LINUX_XVFB_WORKAROUNDS.items():
-            prefs.setdefault(k, v)
+    # No Linux table. It held `gfx.webrender.all=False`, the engine's own default, which does nothing: WebRender is mandatory in 159 and on
+    # llvmpipe `gfx.webrender.reject-software-driver` (true on GTK) is what sends it to software WebRender. The reason it carried
+    # ("`ConnectToCompositor` retries forever under Xvfb") named a function that is not in 159's gfx/ or widget/. A pref is declared once and only if it does something.
 
     # Windows virtual-desktop workarounds (headless=True on Windows).
     if virtual_display and sys.platform == "win32":
@@ -1797,7 +2029,6 @@ def translate_profile_to_prefs(
     _apply_voices(prefs, profile, session_locale)
     _apply_timezone(prefs, timezone)
     _apply_render_seed(prefs, profile)
-    _apply_webrtc_host_ip(prefs, profile)
     _apply_extension_lists(prefs, persona)
     _apply_platform_workarounds(prefs, virtual_display=virtual_display)
     _apply_caller_overlay(prefs, extra_prefs)
@@ -1953,7 +2184,7 @@ def show_cursor_prefs(show_cursor: Any) -> Dict[str, Any]:
     with nobody touching the mouse reads as "this is a bot" to anyone glancing
     at the screen. That was the argument for shipping it off, it is still the
     argument, and the owner decided on 2026-08-28 to ship it ON anyway, the way
-    Camoufox does. A caller who wants the old behaviour passes
+    other hardened Firefox builds do. A caller who wants the old behaviour passes
     `show_cursor=False` and gets it.
 
     ⛔ AND IT IS DECLARED HERE, like every other engine switch, so the browser
@@ -1975,6 +2206,7 @@ def compose_session_prefs(
     humanize: Any = None,
     show_cursor: Any = None,
     survive_hard_kill: bool = False,
+    preload_newtab: Optional[bool] = None,
 ) -> ComposedPrefs:
     """Every pref a session runs with, in one place.
 
@@ -2057,18 +2289,6 @@ def compose_session_prefs(
     prefs.setdefault("zoom.stealth.focus.ignore_os_deactivation",
                      IGNORE_OS_DEACTIVATION)
 
-    # The launch counter's address, declared here for every session. The engine
-    # fetches a five-byte release asset once at startup and the asset's download
-    # count is the number of launches; the address is a pref precisely so that
-    # moving the counter is a declaration in this file and not a rebuild (it
-    # died twice as a repository name compiled into every shipped binary). The
-    # asset lives on the engine's own repository: the thing that pings and the
-    # thing that is counted are the same release series. Engines older than
-    # firefox-21 do not read the pref and keep asking the address compiled into
-    # them. setdefault, so a caller can point it elsewhere or turn the ping off
-    # with `invisible_firefox.usage_ping.enabled`.
-    prefs.setdefault("invisible_firefox.usage_ping.url", USAGE_PING_URL)
-
     if humanize is not None:
         prefs.update(humanize_prefs(humanize))
     # ⛔ ALWAYS EMITTED, never left to the engine. `None` from a caller
@@ -2084,6 +2304,13 @@ def compose_session_prefs(
     # entirely. One composer, one order.
     prefs.update(show_cursor_prefs(
         DEFAULT_SHOW_CURSOR if show_cursor is None else show_cursor))
+    # ⛔ THE ONE DEFAULT THAT STAYS THE RETAIL'S. A retail Firefox keeps a New Tab page preloaded in a process of its own
+    # (a privileged-about process, about 200 MB, and with it a Mozilla site's process): that is what a page's machine looks like,
+    # so the core writes nothing by default. `preload_newtab=False` is a DECLARATION of the caller, asked for by name: it writes
+    # `browser.newtab.preload` false and neither process is born. `True` says the retail's value out loud. A pref of the user's
+    # own (`extra_prefs`) wins over both, as for every other layer.
+    if preload_newtab is not None:
+        prefs.setdefault("browser.newtab.preload", bool(preload_newtab))
     if survive_hard_kill:
         # A persistent profile can be hard-killed - a manager Stop, or a kill
         # mid-startup on a rapid relaunch. Keep Firefox from counting that as a

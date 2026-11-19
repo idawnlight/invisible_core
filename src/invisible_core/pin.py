@@ -79,7 +79,7 @@ part of it. So "the core is not installed", "the core is installed but its own
 dependencies are missing" and "the core is installed but so damaged it cannot
 derive its own version" are not states this module can ever report on. They
 belong to the import floor in each consumer's package __init__, which catches
-the failure of `from invisible_core._pin import ...` and classifies it. That
+the failure of `from invisible_core.pin import ...` and classifies it. That
 split is deliberate; it is why pin_problem() no longer takes a parameter
 describing the health of the core, and why there is no probe of it here.
 
@@ -765,10 +765,6 @@ def pin_report(dist_name: str) -> dict:
         "editable": editable,
         "verdict": verdict,
         "reason": reason,
-        # Kept for the CLI and for callers that only ask "should I stop?".
-        # `ok` is True for "holds" AND for "not-checkable" on purpose; anything
-        # reporting health to a human must read `verdict`.
-        "ok": problem is None,
         "problem": problem,
     }
 

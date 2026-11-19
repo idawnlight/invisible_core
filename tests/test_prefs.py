@@ -22,7 +22,7 @@ from invisible_core.prefs import translate_profile_to_prefs
 
 @pytest.mark.unit
 def test_translate_includes_gpu_renderer_windows(monkeypatch):
-    """On Windows we falsify the GPU to a real-Firefox GPU from the camoufox-derived pool
+    """On Windows we falsify the GPU to a real-Firefox GPU from the telemetry-derived pool
     (prevalence-weighted; full coherent renderer+vendor+params+extensions). The chosen GPU's
     renderer/vendor are applied verbatim and the renderer is in ANGLE D3D11 wire format."""
     monkeypatch.setattr(sys, "platform", "win32")
@@ -138,6 +138,48 @@ def test_translate_has_stealth_baseline_constants():
     prefs = translate_profile_to_prefs(p, timezone="America/New_York")
     assert prefs.get("privacy.resistFingerprinting") is False
     assert "media.peerconnection.enabled" in prefs
+
+
+def test_a_launch_never_registers_its_binary_to_start_at_login():
+    """157's first run writes a Windows Run key for the binary unless the
+    first-run decision is already recorded; every launch here is a first run,
+    and on 2026-10-28 a reboot started twelve registered builds at once."""
+    p = generate_profile(seed=42)
+    prefs = translate_profile_to_prefs(p, timezone="America/New_York")
+    assert prefs.get("browser.startup.windowsLaunchOnLogin.alreadyApplied") is True
+    # The user-facing setting stays the retail's default.
+    assert "browser.startup.windowsLaunchOnLogin.enabled" not in prefs
+
+
+@pytest.mark.unit
+def test_a_launch_keeps_the_first_run_record_in_the_profile(tmp_path, monkeypatch):
+    """The record has to reach the profile the engine reads, not only the dict
+    the core composes: `launch` writes the session's prefs to `user.js` and
+    takes some out on the way, and a pref lost there is a first run again."""
+    import pathlib
+    import tempfile
+    from invisible_core.juggler import instance
+    from invisible_core.juggler.connection import EventListeners
+
+    class _Conn(EventListeners):
+        def startup_send(self, method, params=None):
+            return {}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(instance.connection, "launch", lambda *a, **kw: _Conn())
+    prefs = translate_profile_to_prefs(generate_profile(seed=42),
+                                       timezone="America/New_York")
+    browser = instance.launch("x", prefs=prefs, env={})
+    try:
+        user_js = pathlib.Path(browser._files.profile, "user.js").read_text(
+            encoding="utf-8")
+    finally:
+        browser.close()
+    assert ('user_pref("browser.startup.windowsLaunchOnLogin.alreadyApplied", '
+            'true);') in user_js
 
 
 # The language-table tests (AL1-AL3) moved to test_session_locale.py in 36.x,
@@ -388,7 +430,8 @@ def test_xvfb_workarounds_absent_on_windows(monkeypatch):
     p = generate_profile(seed=42)
     prefs = translate_profile_to_prefs(p, timezone="America/New_York")
     assert "gfx.webrender.all" not in prefs
-    assert "webgl.force-enabled" not in prefs
+    # webgl.force-enabled is gone from every host: the engine answers the gfx
+    # blocklist from the declaration (tests/test_webgl_not_decided_by_host_blocklist.py).
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -419,40 +462,6 @@ def test_virtual_display_workaround_absent_when_disabled(monkeypatch):
 # ──────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.unit
-def test_lan_ip_matches_192_168_pattern():
-    # LI1
-    p = generate_profile(seed=42)
-    prefs = translate_profile_to_prefs(p, timezone="America/New_York")
-    ip = prefs["zoom.stealth.webrtc.host_ip"]
-    m = re.match(r"^192\.168\.(\d+)\.(\d+)$", ip)
-    assert m, f"unexpected LAN IP format: {ip!r}"
-    o3, o4 = int(m.group(1)), int(m.group(2))
-    assert 1 <= o3 <= 254
-    assert 1 <= o4 <= 254
-
-
-@pytest.mark.unit
-def test_lan_ip_deterministic_per_seed():
-    # LI2
-    a = translate_profile_to_prefs(generate_profile(seed=42), timezone="America/New_York")["zoom.stealth.webrtc.host_ip"]
-    b = translate_profile_to_prefs(generate_profile(seed=42), timezone="America/New_York")["zoom.stealth.webrtc.host_ip"]
-    assert a == b
-
-
-@pytest.mark.unit
-def test_lan_ip_seed_zero_has_no_zero_octets():
-    # LI3: code adds +1 so neither dynamic octet should ever be 0.
-    p = generate_profile(seed=0)
-    prefs = translate_profile_to_prefs(p, timezone="America/New_York")
-    ip = prefs["zoom.stealth.webrtc.host_ip"]
-    octets = ip.split(".")
-    assert octets[0] == "192"
-    assert octets[1] == "168"
-    assert int(octets[2]) >= 1
-    assert int(octets[3]) >= 1
-
-
 # ──────────────────────────────────────────────────────────────────────
 #  Linux-specific tests - exercise the branches that only fire when
 #  ``sys.platform.startswith("linux")``. Patched via ``monkeypatch`` so
@@ -462,7 +471,7 @@ def test_lan_ip_seed_zero_has_no_zero_octets():
 
 @pytest.mark.unit
 def test_gpu_renderer_set_from_profile_on_linux(monkeypatch):
-    # PG1: on Linux (as on EVERY host) we apply the camoufox-derived Windows-ANGLE GPU persona,
+    # PG1: on Linux (as on EVERY host) we apply the telemetry-derived Windows-ANGLE GPU persona,
     # so the page sees a consistent Windows GPU (rule: always look Windows). The C++ WebGL
     # override is platform-independent (SanitizeRenderer is pure string regex), so the same
     # persona renderer/vendor is presented on Linux too - no more "Generic Renderer".
@@ -524,16 +533,16 @@ def test_webgl_extensions_preserved_on_linux(monkeypatch):
 
 @pytest.mark.unit
 def test_xvfb_workarounds_applied_on_linux(monkeypatch):
-    # XW1: Linux Firefox under Xvfb can't run WebRender, so we force the
-    # software path. These are added via ``setdefault`` so callers can
-    # still override them via ``extra_prefs``.
+    # XW1: there is no Linux table any more (it held one dead pref, see _apply_platform_workarounds):
+    # nothing of it reaches the prefs, and what a caller passes in ``extra_prefs`` still wins.
     monkeypatch.setattr(sys, "platform", "linux")
     p = generate_profile(seed=42)
     prefs = translate_profile_to_prefs(p, timezone="America/New_York")
-    assert prefs["gfx.webrender.all"] is False
-    assert prefs["webgl.force-enabled"] is True
-    # `gfx.webrender.force-disabled` is gone since 49.46.0: no file of the
+    # `gfx.webrender.all=False` is gone: it was the engine's default and did nothing
+    # (WebRender is mandatory in 159; on llvmpipe `gfx.webrender.reject-software-driver`
+    # decides). `gfx.webrender.force-disabled` is gone since 49.46.0: no file of the
     # engine reads it ([B171], tests/test_pref_types.py).
+    assert "gfx.webrender.all" not in prefs
     assert "gfx.webrender.force-disabled" not in prefs
 
 
@@ -545,9 +554,9 @@ def test_xvfb_workarounds_caller_can_override(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     p = generate_profile(seed=42)
     prefs = translate_profile_to_prefs(
-        p, extra_prefs={"webgl.force-enabled": False}, timezone="America/New_York"
+        p, extra_prefs={"gfx.webrender.all": True}, timezone="America/New_York"
     )
-    assert prefs["webgl.force-enabled"] is False
+    assert prefs["gfx.webrender.all"] is True
 
 
 @pytest.mark.unit

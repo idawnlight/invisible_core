@@ -72,9 +72,9 @@ _LEAKS = ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
           "INVISIBLE_DOWNLOAD_DEADLINE", "STEALTHFOX_GITHUB_TOKEN", "GITHUB_TOKEN",
           "INVISIBLE_SEAL_FILE", "INVISIBLE_CORE_PIN", "INVISIBLE_CORE_AUTOFIX",
           "INVISIBLE_CORE_AUTOFIX_TIMEOUT", "UV", "STEALTHFOX_GEOIP_MMDB",
-          "STEALTHFOX_FONT_MANIFEST", "STEALTHFOX_WEBRTC_PUBLIC_IP",
+          "STEALTHFOX_FONT_MANIFEST", "STEALTHFOX_WEBRTC_NETWORK",
           "INVPW_CURSOR_TIMER", "INVISIBLE_CORE_AUTOFIX_ATTEMPTED",
-          "INVPW_SESSION_TOKEN", "INVPW_DESKTOP", "STEALTHFOX_WEBRTC_DISABLE_IPV6")
+          "INVPW_SESSION_TOKEN", "INVPW_DESKTOP")
 
 
 def _run(cmd, *, timeout: int = 600, check: bool = True, env=None, cwd=None):
@@ -330,7 +330,7 @@ def test_the_published_version_has_a_github_release():
     checked = 0
     cut_short = None
     for version in live:
-        url = f"https://api.github.com/repos/feder-cr/{REPO}/releases/tags/v{version}"
+        url = f"https://api.github.com/repos/oss-invisible/core/releases/tags/v{version}"
         try:
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=30) as resp:
@@ -358,7 +358,7 @@ def test_the_published_version_has_a_github_release():
 
     problems = []
     # The LEDGER is the fourth record, and it costs no API call: it is a file in
-    # this repository. `version_gate check` compares it to the index too, but
+    # this repository. `python -m invisible_core.release check` compares it to the index too, but
     # only on a release - so a version published outside the gate stays invisible
     # until the NEXT release is refused by it, which is how the gap from
     # 2026-08-02 was found. Here it surfaces on every run of this job.

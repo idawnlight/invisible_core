@@ -87,6 +87,7 @@ from dataclasses import dataclass
 from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
                     Tuple)
 
+from .._floats import exact_sum, log2 as exact_log2
 from ..seedmix import sub_seed
 
 __all__ = [
@@ -441,10 +442,38 @@ _LEFT_HAND = set("`12345qwertasdfgzxcvb~!@#$%QWERTASDFGZXCVB")
 _RIGHT_HAND = set("67890-=yuiop[]\\hjkl;'nm,./^&*()_+YUIOP{}|HJKL:\"NM<>?")
 
 
-def _hand(ch: str) -> str:
-    if ch in _LEFT_HAND:
+#: Which hand presses each physical key, by DOM `code`: touch typing on a
+#: standard row-staggered keyboard. The hand follows the KEY, not the
+#: character: on AZERTY `a` is on KeyQ and on QWERTZ `z` is on KeyY.
+_LEFT_CODES = frozenset(
+    ["Backquote", "IntlBackslash"] + ["Digit%d" % d for d in range(1, 6)]
+    + ["Key" + c for c in "QWERTASDFGZXCVB"])
+_RIGHT_CODES = frozenset(
+    ["Digit6", "Digit7", "Digit8", "Digit9", "Digit0", "Minus", "Equal",
+     "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote",
+     "Comma", "Period", "Slash", "IntlRo"]
+    + ["Key" + c for c in "YUIOPHJKLNM"])
+
+
+def _hand(ch: str, layout: str = "us") -> str:
+    """"L", "R" or "?" for the hand that types `ch` on the persona's keyboard.
+
+    ⛔ BY PHYSICAL KEY. The character tables above are the US keyboard's; on
+    any other layout they named the wrong hand (an Italian `ò` was "?", a
+    French `a` was right-hand). The key comes from the layout's closure; the
+    US answer is unchanged, character for character."""
+    if layout in ("us", "00000409"):
+        if ch in _LEFT_HAND:
+            return "L"
+        if ch in _RIGHT_HAND:
+            return "R"
+        return "?"
+    from .keyboard import closure_for
+    d = closure_for(layout).get(ch)
+    code = d.get("code") if d and len(ch) == 1 else None
+    if code in _LEFT_CODES:
         return "L"
-    if ch in _RIGHT_HAND:
+    if code in _RIGHT_CODES:
         return "R"
     return "?"
 
@@ -629,7 +658,7 @@ def plan_press_settle(persona: PointerPersona, nonce: int = 0) -> float:
 
 
 def plan_typing(text: str, persona: TypingPersona,
-                nonce: int = 0) -> List[Tuple[float, float]]:
+                nonce: int = 0, layout: str = "us") -> List[Tuple[float, float]]:
     """One `(dwell_ms, gap_ms)` per character of `text`.
 
     `dwell_ms` is how long that key stays down; `gap_ms` is the wait before the
@@ -653,7 +682,7 @@ def plan_typing(text: str, persona: TypingPersona,
         if ch == nxt:
             gap *= persona.same_key_factor
         else:
-            a, b = _hand(ch), _hand(nxt)
+            a, b = _hand(ch, layout), _hand(nxt, layout)
             if a != "?" and b != "?":
                 gap *= (persona.alternate_hand_factor if a != b
                         else persona.same_hand_factor)
@@ -693,31 +722,12 @@ def plan_hesitation(persona: TypingPersona, act: str, nonce: int = 0,
     of the same kind in one session two different pauses.
     """
     r = _rng(persona.seed, act, nonce)
-    return sum(persona.hesitation_ms(r) for _ in range(max(1, times)))
+    return exact_sum(persona.hesitation_ms(r) for _ in range(max(1, times)))
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Movement primitives
 # ──────────────────────────────────────────────────────────────────────
-
-def _fitts_ms(persona: PointerPersona, rng: random.Random,
-              distance: float, target_w: float) -> float:
-    """Movement time for a pointing motion. [lit] Fitts, Shannon form.
-
-    ``target_w`` is the effective width of what is being aimed at along the
-    direction of travel. A movement that aims at nothing in particular passes
-    a large width, which is why parking the cursor is fast and hitting a small
-    button is slow - the property a fixed ~1 s duration cannot express.
-    """
-    w = max(4.0, target_w)
-    idx = math.log2(max(distance, 1.0) / w + 1.0)
-    mt = persona.fitts_a_ms + persona.fitts_b_ms * idx
-    mt *= math.exp(rng.gauss(0.0, persona.mt_sigma))
-    # Floor: no aimed hand movement completes in under ~60 ms. [lit] simple
-    # reaction time alone is ~150-200 ms; 60 ms is a deliberately loose floor
-    # that only guards against a pathological log-normal draw.
-    return _clamp(mt, 60.0, 6000.0)
-
 
 def _leg(
     persona: PointerPersona,
@@ -1093,7 +1103,7 @@ def plan_idle(
         pos = (seg[-1].x, seg[-1].y)
         # The pause is carried as the lead delay of the segment's first step,
         # so summing the segment counts it exactly once.
-        elapsed += sum(s.delay_ms for s in seg)
+        elapsed += exact_sum(s.delay_ms for s in seg)
 
     while True:
         pause = _pause_ms(persona, r)
@@ -1124,7 +1134,7 @@ def plan_idle(
     # Measured against what the steps actually carry, not against `elapsed`:
     # an episode that produced no event still consumed its pause, and that
     # time has to end up somewhere or the plan under-reports its duration.
-    residual = duration_ms - sum(s.delay_ms for s in steps)
+    residual = duration_ms - exact_sum(s.delay_ms for s in steps)
     if residual >= 5.0:
         steps.append(Step(x=pos[0], y=pos[1], delay_ms=residual,
                           kind=_WAIT_KIND))
@@ -1246,7 +1256,7 @@ def overshoot_probability(persona: PointerPersona, distance: float,
     move (ID ~ 1) corrects rarely and a hard one (ID ~ 6) corrects most of the
     time.
     """
-    idx = math.log2(max(distance, 1.0) / max(width, 4.0) + 1.0)
+    idx = exact_log2(max(distance, 1.0) / max(width, 4.0) + 1.0)
     p = (0.10 + 0.085 * idx) * persona.overshoot_bias
     return _clamp(p, 0.03, 0.88)
 

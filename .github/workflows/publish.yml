@@ -18,6 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  GITHUB_TOKEN: ${{ github.token }}
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   INVISIBLE_CORE_AUTOFIX: "off"
 
@@ -38,7 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]" build hatchling
       - name: Arm checkout hooks
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
       - name: Test the tagged source
         run: python -m pytest -q -rs
       - name: Build and verify the release artifacts

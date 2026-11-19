@@ -2,11 +2,11 @@
 
 We expose a FALSE GPU (this is a multi-user tool - never leak each host's real GPU),
 chosen deterministically per seed from a small set of renderer-string "buckets" that
-Firefox's SanitizeRenderer emits and that FP Pro's tampering_ml scores as CLEAN.
+Firefox's SanitizeRenderer emits and that the studied system's tampering_ml scores as CLEAN.
 
 ## What actually gates a persona (calibrated 2026-06-14, supersedes the old theory)
 
-The blocker is NOT anti_detect and NOT a "render-vs-renderer" check. It is FP Pro's
+The blocker is NOT anti_detect and NOT a "render-vs-renderer" check. It is the studied system's
 **tampering_ml** (gate <=0.5), a holistic ML coherence score. We reverse-engineered its
 GPU sensitivity with single-variable A/Bs on demo.fingerprint.com (deterministic per
 (seed, renderer, IP); tools in tests/probes/gpu_webgl/: _gpu_isolate.py, _gpu_landscape.py,
@@ -20,7 +20,7 @@ _gpu_sweep.py, _gpu_sweep2.py, _gpu_persona_pure.py). Findings:
      for OTHER detectors that cross-check cores/screen, just not for this).
   3. It is NOT render-consistency: a cross-vendor AMD string is CLEAN on our Intel-Arc
      host. So the real silicon's pixels are not the dominant signal; falsifying to a
-     different vendor works - IF the string is one FP Pro scores low.
+     different vendor works - IF the string is one the studied system scores low.
 
 Sweep over all 10 Windows SanitizeRenderer buckets x 10 seeds (clean = tml<=0.5 AND not
 anti_detect), on our Intel Arc A750 host:
@@ -64,6 +64,8 @@ from __future__ import annotations
 import sys
 from typing import Dict, List, Optional
 
+from ._floats import exact_sum
+
 # Vendor-independent ext lists (native order, Arc host capture). Identical for every persona
 # because the set+order is fixed by Firefox+ANGLE on D3D11 FL11_0, not by the GPU vendor.
 _EXT1 = (
@@ -87,13 +89,13 @@ _EXT2 = (
 
 # ── Real-Firefox GPU pool (2026-06-18, supersedes the 2-bucket sweep above) ───────────────
 # The personas are now sourced from `_fpforge/data/webgl_gpu_pool.json` - an OFFLINE extract
-# of camoufox's real-Firefox WebGL telemetry DB (17 Windows GPUs with their REAL per-OS
+# of a real-Firefox WebGL telemetry DB (17 Windows GPUs with their REAL per-OS
 # prevalence AND the full coherent WebGL fingerprint: renderer + vendor + extensions +
 # ~100 getParameter values + shader-precision formats). prefs.py applies ALL of these, not
 # just the renderer string. The linchpin A/B (2026-06-18) proved that the OLD "NVIDIA 0/10"
 # verdict was an artifact of spoofing the renderer string over the host's REAL (Arc) params:
-# FP Pro cross-checks renderer<->params, so a GTX 980 string over Arc params mismatched
-# (~0.7-0.85). Injecting camoufox's REAL GTX 980 params makes it coherent (tml median 0.333,
+# the studied system cross-checks renderer<->params, so a GTX 980 string over Arc params mismatched
+# (~0.7-0.85). Injecting the telemetry's REAL GTX 980 params makes it coherent (tml median 0.333,
 # flags clean). So the params are NOT vendor-independent (the old assumption) and per-GPU
 # real data is what unlocks the full real GPU mix - including NVIDIA (~47% of real FF-Win),
 # which we no longer gate.
@@ -125,6 +127,9 @@ def _gpu_pool() -> List[Dict]:
             "gpu_class": cls,
             "prefs": prefs,
             "weight": float(e["prob"]),
+            # set on the slots that replaced the Direct3D 10 class personas: the
+            # real GPU the entry stands for (a label of win_gfx_devices.json)
+            "device": e.get("device"),
         })
     _GPU_POOL_CACHE = pool
     return pool
@@ -150,7 +155,7 @@ def _draw(pool: List[Dict], seed: int) -> Dict:
     SAME cumulative arithmetic instead of a second copy of it. It must stay the
     only place that walks a cumulative weight: two copies of this loop is how a
     seed starts landing on one entry here and another one there."""
-    total = sum(p["weight"] for p in pool) or 1.0
+    total = exact_sum(p["weight"] for p in pool) or 1.0
     h = (((int(seed) * _IDENTITY_MULTIPLIER) % _IDENTITY_MODULUS)
          / float(_IDENTITY_MODULUS) * total)
     cum = 0.0
@@ -212,7 +217,7 @@ def choose_persona(seed: int, pin: Optional[Dict] = None) -> Optional[Dict]:
     A renderer string ALONE can never be honoured, which is why a pin SELECTS
     from the validated pool rather than setting a free string: the ~81
     getParameter values, the shader precisions and the extension list travel with
-    the name, and a name over foreign params is the name<->params mismatch FP Pro
+    the name, and a name over foreign params is the name<->params mismatch the studied system
     scores (~0.70 - see `prefs._apply_gpu_persona`). The domain here is finite
     and known (the pool), so a value the pool cannot present is REFUSED rather
     than quietly dropped.
@@ -283,6 +288,61 @@ def persona_for(renderer: str, vendor: str) -> Optional[Dict]:
     return None
 
 
+# ── The real device behind the persona (2026-11-01) ──────────────────────────
+# A pool renderer is a SanitizeRenderer bucket ("GeForce GTX 980" stands for every
+# GeForce from the 900 series up), but the gfx blocklist decides per real device and
+# driver, and inside three buckets the outcomes differ (video decoder reuse, zero-copy
+# decode, hardware encode, native GL WebGL). So a persona also declares one real
+# device of its bucket, and the blocklist outcomes official Firefox 159 gives that
+# device: `_fpforge/data/win_gfx_devices.json`, measured on the retail build with
+# Mozilla's MOZ_GFX_SPOOF_* variables (coord/gfxinfo). The engine answers
+# GetFeatureStatus from them on every host, so the host adapter decides nothing.
+_DEVICES_PATH = _POOL_PATH.with_name("win_gfx_devices.json")
+_DEVICES_CACHE: Optional[Dict[str, List[Dict]]] = None
+
+
+def _gfx_devices() -> Dict[str, List[Dict]]:
+    global _DEVICES_CACHE
+    if _DEVICES_CACHE is None:
+        import json
+        _DEVICES_CACHE = json.loads(_DEVICES_PATH.read_text(encoding="utf-8"))["by_renderer"]
+    return _DEVICES_CACHE
+
+
+def choose_gfx_device(persona: Optional[Dict], seed: int) -> Optional[Dict]:
+    """The real device this seed's persona declares, or None when its bucket has none.
+
+    Drawn from its own stream (a hash of the seed, not `_IDENTITY_MULTIPLIER`), so
+    adding it moved no seed's persona: the bucket is still `_draw`'s answer and only
+    the device inside it is new. Weighted by each device's `weight`: its GPU family's
+    share among Firefox desktop users in the Intel and AMD integrated buckets, equal
+    elsewhere (win_gfx_devices.json `_meta.weights`). A pool entry that names its own
+    device declares that one."""
+    devs = _gfx_devices().get(persona["renderer"]) if persona else None
+    if not devs:
+        return None
+    if persona.get("device"):
+        return next(d for d in devs if d["label"] == persona["device"])
+    import hashlib
+    h = int.from_bytes(hashlib.sha256(b"gfx-device:%d" % int(seed)).digest()[:8], "big")
+    total = exact_sum(d["weight"] for d in devs)
+    x = h / float(1 << 64) * total
+    cum = 0.0
+    for d in devs:
+        cum += d["weight"]
+        if x < cum:
+            return d
+    return devs[-1]
+
+
+def gfx_device_for(renderer: str, label: str) -> Optional[Dict]:
+    """The device a Profile declares - a READ of `Profile.gpu.device`, like `persona_for`."""
+    for d in _gfx_devices().get(renderer, []):
+        if d["label"] == label:
+            return d
+    return None
+
+
 def forced_gpu_class(seed: int) -> Optional[str]:
     """The gpu_class of the persona this seed presents. A QUERY, not a knob.
 
@@ -308,7 +368,7 @@ def forced_gpu_class(seed: int) -> Optional[str]:
 
 # ── Render-noise seed pool (canvas/WebGL gamma) ──────────────────────────────
 # zoom.stealth.fpp.hw_seed drives the per-seed canvas2D + WebGL readPixels gamma
-# LUT in C++. The render-image HASH it produces is the DOMINANT FP Pro tampering_ml
+# LUT in C++. The render-image HASH it produces is the studied system's DOMINANT tampering_ml
 # driver (proven 2026-06-14: holding a fixed profile and varying ONLY hw_seed moved
 # tml 0.25->0.75). The monotonic gamma preserves the GPU's render structure, so some
 # hw_seeds yield a "suspicious" render hash. We therefore DECOUPLE the render-noise

@@ -26,7 +26,8 @@ import io
 
 import pytest
 
-from invisible_core import _env, _pin
+from invisible_core import _env
+from invisible_core import pin as _pin
 
 pytestmark = pytest.mark.unit
 
