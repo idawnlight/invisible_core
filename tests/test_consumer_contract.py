@@ -331,7 +331,7 @@ CONTRACT = {
     "invisible_core.juggler.injected": {
         # ContextDestroyed since 41.36.0: a world that went, typed once here
         # instead of matched by its sentence in each client.
-        "ContextDestroyed", "EvaluationError", "InjectedScript", "UTILITY_WORLD",
+        "CALLER_WORLD", "ContextDestroyed", "EvaluationError", "InjectedScript", "UTILITY_WORLD",
         # Since 48.42.0, imported by invisible_puppeteer: a predicate's result
         # judged as JavaScript judges it, once here (late, as above).
         "js_truthy",

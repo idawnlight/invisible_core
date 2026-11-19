@@ -4,9 +4,9 @@ This fork supplies the profile generator, Firefox preferences, shared Juggler
 client, browser process management, and engine installer used by
 [invisible_playwright](https://github.com/idawnlight/invisible_playwright).
 
-The current pair is `invisible_core 159.49.2` and
-`invisible_playwright 0.43.2`, using Firefox 159.0 from the native
-[`firefox-159.0-r1` release](https://github.com/idawnlight/firefox_antidetect_patch/releases/tag/firefox-159.0-r1).
+The current pair is `invisible_core 160.49.0` and
+`invisible_playwright 0.44.0`, using Firefox 160.0 from the native
+[`firefox-160.0-r1` release](https://github.com/idawnlight/firefox_antidetect_patch/releases/tag/firefox-160.0-r1).
 This release provides **Linux x86_64** binaries. Python 3.11 or newer and Git
 are required.
 
@@ -16,8 +16,8 @@ Install both Python packages from their Git tags using uv:
 uv venv .venv
 . .venv/bin/activate
 uv pip install \
-  "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v159.49.2" \
-  "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@v0.43.2"
+  "invisible-core @ git+https://github.com/idawnlight/invisible_core.git@v160.49.0" \
+  "invisible-playwright @ git+https://github.com/idawnlight/invisible_playwright.git@v0.44.0"
 ```
 
 Start a session normally:
@@ -46,8 +46,8 @@ python -c 'from invisible_core import ensure_binary; print(ensure_binary())'
 ```
 
 Both Python repositories use `main` and their own version tags. The native
-Firefox repository maintains `release/159`; its engine tags, such as
-`firefox-159.0-r1`, are independent of the Python package versions. Updating
+Firefox repository maintains `release/160`; its engine tags, such as
+`firefox-160.0-r1`, are independent of the Python package versions. Updating
 the default bundled seal requires a new core package version and the matching
 wrapper dependency pin.
 
