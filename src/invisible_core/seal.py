@@ -417,32 +417,21 @@ def load_seal(path: "str | os.PathLike[str]") -> Seal:
     return _parse_seal_bytes(raw, str(p))
 
 
-_ACTIVE: Optional[Seal] = None
-
-
 def active_seal() -> Seal:
-    """The seal this process runs under. Resolved once, at first use.
+    """The seal this process runs under, read on EVERY call (the packaged file, or the one INVISIBLE_SEAL_FILE
+    names): nothing is kept, so what resolving it costs is seen at each caller.
 
     INVISIBLE_SEAL_FILE substitutes a different seal. It is NOT an off switch:
     the substituted seal drives the User-Agent too, so the claim always moves
     with the engine. It always announces itself on stderr.
     """
-    global _ACTIVE
-    if _ACTIVE is None:
-        override = os.environ.get(SEAL_FILE_ENV)
-        if override:
-            s = load_seal(override)
-            print(f"invisible-core: substituted seal in effect: {s.describe()} "
-                  f"[{SEAL_FILE_ENV}={override}]", file=sys.stderr)
-        else:
-            s = load_seal(packaged_seal_path())
-        _ACTIVE = s
-    return _ACTIVE
-
-
-def _reset_active_seal_for_tests() -> None:
-    global _ACTIVE
-    _ACTIVE = None
+    override = os.environ.get(SEAL_FILE_ENV)
+    if override:
+        s = load_seal(override)
+        print(f"invisible-core: substituted seal in effect: {s.describe()} "
+              f"[{SEAL_FILE_ENV}={override}]", file=sys.stderr)
+        return s
+    return load_seal(packaged_seal_path())
 
 
 # ---------------------------------------------------------------- engine facts
@@ -558,33 +547,18 @@ def _read_juggler_provenance(root: Path) -> Tuple[str, bool, int, list]:
     return ("none", False, 0, notes)
 
 
-_IDENT_CACHE: Dict[tuple, EngineIdentity] = {}
-
-
 def read_engine_identity(entry: "str | os.PathLike[str]") -> EngineIdentity:
     """What the engine says about itself. One ini read plus one zip central
-    directory read (measured 7-12 ms warm on Windows), memoized per process."""
+    directory read (measured 7-12 ms warm on Windows), made on every call: nothing is kept."""
     p = Path(entry)
     try:
-        st = p.stat()
+        p.stat()
     except OSError as e:
         raise EngineMismatch(
             f"no executable at {p}\n"
             f"  (nothing to verify: the path does not exist or is not readable: {e})",
             problems=(f"no executable at {p} ({e})",), entry=p)
     root = resource_root(p)
-    ini_stats = []
-    for name in ("application.ini", "platform.ini"):
-        try:
-            ini_stat = (root / name).stat()
-            ini_stats.append((ini_stat.st_mtime_ns, ini_stat.st_size))
-        except OSError:
-            ini_stats.append(None)
-    key = (str(p), st.st_mtime_ns, st.st_size, *ini_stats)
-    hit = _IDENT_CACHE.get(key)
-    if hit is not None:
-        return hit
-
     notes = []
     app = _parse_ini(root / "application.ini")
     plat = _parse_ini(root / "platform.ini")
@@ -596,7 +570,7 @@ def read_engine_identity(entry: "str | os.PathLike[str]") -> EngineIdentity:
     layout, juggler_present, marked, jnotes = _read_juggler_provenance(root)
     notes.extend(jnotes)
 
-    ident = EngineIdentity(
+    return EngineIdentity(
         entry=p, root=root,
         version=app.get("App", {}).get("Version"),
         build_id=app.get("App", {}).get("BuildID"),
@@ -607,8 +581,6 @@ def read_engine_identity(entry: "str | os.PathLike[str]") -> EngineIdentity:
         source_commit=app.get("App", {}).get("SourceStamp"),
         platform_source_commit=plat.get("Build", {}).get("SourceStamp"),
     )
-    _IDENT_CACHE[key] = ident
-    return ident
 
 
 def expected_build_ids_for(ident: EngineIdentity, seal: Seal,

@@ -24,6 +24,13 @@ the run the day it is written; nobody keeps a list.
         is can be said only by the workflow, which checks main out: a copy that cannot
         be read is red; "main has no copy" is declared with --main-has-no-script, and
         only for the pull request that adds this file.
+    wrapper_on_this_core.py wrapper-ref --event NAME [--body-file PATH]
+        which branch of the wrapper the job checks out: `main`, always, except on a
+        pull request whose body DECLARES another with one line, `wrapper-ref: <branch>`
+        (see `choose_wrapper_ref`): the branch must exist in the wrapper's repository.
+        Prints the ref; writes it and the reason to $GITHUB_OUTPUT (`ref=`) and to
+        $GITHUB_STEP_SUMMARY. A malformed line, two lines or a missing branch is exit 1
+        with the reason. The judge and the list to compare with are still main's.
     wrapper_on_this_core.py engine
         the engine the seal of the installed core names, which must be PUBLISHED: if
         its release or the asset of this system is not there it is exit 1 with the
@@ -65,7 +72,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-__all__ = ["EXCLUDED", "WITNESSES", "witness_problems", "computed_list", "excluded_nodes", "files_of", "judge_junit", "load_seconds",
+__all__ = ["WrapperRefError", "choose_wrapper_ref", "declared_wrapper_refs", "EXCLUDED", "WITNESSES", "witness_problems", "computed_list", "excluded_nodes", "files_of", "judge_junit", "load_seconds",
            "missing_from", "plan_parts", "problems_in_junit"]
 
 #: A wrapper test file that imports the Juggler client of the core.
@@ -429,6 +436,107 @@ def judge_junit(junit_paths: list[Path], files: list[str], codes: list[int]) -> 
 
 # ------------------------------------------------------------------ commands
 
+# ------------------------------------------------------- the wrapper branch to try
+#
+# The job tries the wrapper's `main` against this core. A pull request of the core that
+# changes an API the wrapper uses can name the wrapper branch that has the matching
+# change, with ONE line of its body:
+#
+#     wrapper-ref: <branch>
+#
+# Grammar: the line starts with `wrapper-ref:` (nothing before it, lower case), ONE space,
+# then the branch, and nothing else on the line (a trailing CR is ignored: GitHub's web
+# form writes CRLF). The branch is made of letters, digits and `. _ - /`; it does not
+# start with `-`, `.` or `/`, does not end with `/`, `.` or `.lock`, and has no `..`
+# and no `//`. A line that starts with `wrapper-ref` followed by optional blanks and `:`
+# in any case but does not fit is an ERROR, not an ignored line; so are two such lines.
+# Only a pull request is read: on a push (main) and on a tag the ref is `main` and the
+# body, if there is one, is not looked at.
+
+WRAPPER_REPO_URL = "https://github.com/oss-invisible/playwright"
+WRAPPER_DEFAULT_REF = "main"
+_DECLARATION = re.compile(r"^wrapper-ref[ \t]*:", re.IGNORECASE)
+_DECLARATION_OK = re.compile(r"^wrapper-ref: ([A-Za-z0-9._/-]+)$")
+
+
+class WrapperRefError(Exception):
+    """The body of the pull request declares a wrapper ref that cannot be used."""
+
+
+def declared_wrapper_refs(body: str) -> list[str]:
+    """The lines of ``body`` that try to declare a wrapper ref (right or wrong), CR cut."""
+    return [line.rstrip("\r") for line in (body or "").split("\n") if _DECLARATION.match(line)]
+
+
+def _branch_name_problem(name: str) -> str | None:
+    if name[0] in "-./" or name[-1] in "/." or name.endswith(".lock") or ".." in name or "//" in name:
+        return "it is not a valid branch name (no leading `-`, `.` or `/`, no trailing `/` or `.` or `.lock`, no `..`, no `//`)"
+    return None
+
+
+def _ls_remote_heads(branch: str) -> str:
+    """What `git ls-remote --heads` of the wrapper's repository says about ``branch``."""
+    done = subprocess.run(["git", "ls-remote", "--heads", WRAPPER_REPO_URL, f"refs/heads/{branch}"],
+                          capture_output=True, text=True, timeout=120)
+    if done.returncode != 0:
+        raise WrapperRefError(f"cannot ask {WRAPPER_REPO_URL} for its branches "
+                              f"(git ls-remote exit {done.returncode}): {done.stderr.strip()}")
+    return done.stdout
+
+
+def choose_wrapper_ref(event: str, body: str | None, ls_remote=None) -> tuple[str, str]:
+    """(ref, why): the branch of the wrapper to check out. Raises ``WrapperRefError``.
+
+    ``ls_remote(branch)`` returns the text of `git ls-remote --heads <wrapper> refs/heads/<branch>`
+    (injected by the tests)."""
+    if event != "pull_request":
+        return WRAPPER_DEFAULT_REF, f"event `{event}`: always the wrapper's {WRAPPER_DEFAULT_REF}, a `wrapper-ref:` line is not read"
+    lines = declared_wrapper_refs(body or "")
+    if not lines:
+        return WRAPPER_DEFAULT_REF, f"no `wrapper-ref:` line in the body of the pull request: the wrapper's {WRAPPER_DEFAULT_REF}"
+    if len(lines) > 1:
+        raise WrapperRefError("the body of the pull request has " + str(len(lines)) + " `wrapper-ref:` lines, one is allowed: "
+                              + " | ".join(repr(x) for x in lines))
+    m = _DECLARATION_OK.match(lines[0])
+    if not m:
+        raise WrapperRefError(f"malformed line {lines[0]!r}: it is `wrapper-ref: <branch>`, one space, the branch "
+                              "made of letters, digits and . _ - / and nothing else")
+    branch = m.group(1)
+    problem = _branch_name_problem(branch)
+    if problem:
+        raise WrapperRefError(f"malformed line {lines[0]!r}: {problem}")
+    out = (ls_remote or _ls_remote_heads)(branch)
+    if not any(row.split("\t")[-1].strip() == f"refs/heads/{branch}" for row in out.splitlines() if row.strip()):
+        raise WrapperRefError(f"the branch `{branch}` declared by the pull request does not exist in {WRAPPER_REPO_URL}")
+    return branch, f"declared by the pull request (`wrapper-ref: {branch}`), found in the wrapper's repository"
+
+
+def _cmd_wrapper_ref(args) -> int:
+    body = Path(args.body_file).read_text(encoding="utf-8", errors="replace") if args.body_file else ""
+    try:
+        ref, why = choose_wrapper_ref(args.event, body)
+    except WrapperRefError as exc:
+        print(f"wrapper-ref: {exc}", file=sys.stderr)
+        _write_summary(f"### wrapper tried on this core\n\n**RED**: {exc}")
+        return 1
+    print(ref)
+    print(f"wrapper ref: {ref} ({why})", file=sys.stderr)
+    _write_summary(f"### wrapper tried on this core\n\nThe wrapper's tests ran on the branch **`{ref}`** of "
+                   f"oss-invisible/playwright: {why}.")
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as fh:
+            fh.write(f"ref={ref}\n")
+    return 0
+
+
+def _write_summary(text: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+
+
 def _cmd_list(args) -> int:
     for f in computed_list(Path(args.wrapper)):
         print(f)
@@ -589,6 +697,9 @@ def main(argv=None) -> int:
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--main-script")
     g.add_argument("--main-has-no-script", action="store_true")
+    s = sub.add_parser("wrapper-ref")
+    s.add_argument("--event", required=True)
+    s.add_argument("--body-file")
     sub.add_parser("engine")
     s = sub.add_parser("plan")
     s.add_argument("--wrapper", required=True)
@@ -605,7 +716,7 @@ def main(argv=None) -> int:
     s.add_argument("--junit-dir", default="wrapper-on-this-core-junit")
     args = p.parse_args(argv)
     return {"list": _cmd_list, "compare": _cmd_compare, "engine": _cmd_engine, "plan": _cmd_plan,
-            "run": _cmd_run}[args.cmd](args)
+            "run": _cmd_run, "wrapper-ref": _cmd_wrapper_ref}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -154,6 +154,20 @@ def _no_geoip_download(monkeypatch, request):
                         raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_intermediates_download(monkeypatch, request):
+    """The launch declares Mozilla's intermediates list (`launch.write_user_js`), and a launch is made by many tests that think they are hermetic.
+
+    A cold cache would download the list from Mozilla in line, so the function the launch calls is stubbed, as `ensure_geoip_mmdb` is above: no list, no
+    request. The tests of the list itself bring the real one back by name, and a test marked `e2e` (it needs the network, by that marker's own definition)
+    gets it untouched."""
+    if request.node.get_closest_marker("e2e"):
+        return
+    import invisible_core._intermediates as _im
+
+    monkeypatch.setattr(_im, "ensure_intermediates", lambda *a, **kw: None)
+
+
 class _ExitNotAskedInTests(ConnectionError):
     """What a hermetic test gets when it asks the network for its exit."""
 
@@ -183,9 +197,9 @@ def _no_egress_discovery(monkeypatch, request):
     `_geo.discover_egress_ip` or `_geo._http_get`, which overrides this;
     an `e2e` test gets the network.
 
-    The direct exit is kept for two minutes per process (`_geo._egress_kept`),
-    so each test also starts with nothing kept and nothing in flight: an answer
-    one test chose must not be the answer of the next.
+    The core keeps no exit between two calls; a request still in flight
+    (`_geo._egress_flight`) is cleared, so each test starts with nothing in
+    flight: an answer one test chose must not be the answer of the next.
     """
     if request.node.get_closest_marker("e2e"):
         return
@@ -197,7 +211,6 @@ def _no_egress_discovery(monkeypatch, request):
             "monkeypatch invisible_core._geo.discover_egress_ip to give it one")
 
     monkeypatch.setattr(_geo, "_http_get", refuse)
-    monkeypatch.setattr(_geo, "_egress_kept", None)
     monkeypatch.setattr(_geo, "_egress_flight", None)
 
 

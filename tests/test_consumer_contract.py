@@ -96,6 +96,7 @@ CONTRACT = {
         "configure_proxy", "ensure_binary",
         "parse_proxy",
         "ensure_geoip_mmdb",
+        "update_intermediates",
         "get_default_args", "get_default_stealth_prefs",
         "make_virtual_display", "network_to_declare", "prepare_session_geo",
         "resolve_session_timezone",
@@ -107,6 +108,9 @@ CONTRACT = {
     },
     "invisible_core._offloop": {
         "off_the_loop",
+    },
+    "invisible_core._proxy": {
+        "UDP_EXIT_VALUES",
     },
     "invisible_core._udp_exit": {
         "context_proxy_command", "launch_proxy_command", "stun_servers",
@@ -291,6 +295,7 @@ def test_the_private_modules_in_the_contract_are_named_as_such():
     assert private == {
         'invisible_core._fpforge': 2,
         'invisible_core._offloop': 1,
+        'invisible_core._proxy': 1,
         'invisible_core._udp_exit': 3,
         'invisible_core.juggler._behaviour': 5,
         'invisible_core.juggler._gen_protocol': 1,

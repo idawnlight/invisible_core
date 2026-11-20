@@ -464,6 +464,9 @@ class Lifecycle:
                 # (C7 of the event-filter audit, [B302]). Playwright clears
                 # the lifecycle at the commit too.
                 f.states = set()
+                # Its quiet starts here too, as Playwright's idle timer restarts at the commit (`_onClearLifecycle`):
+                # the silence before it (a process swap after the parent ended the request) is not this document's.
+                self._last_activity = self._last_crowded = time.monotonic()
             f.states.add("commit")
             # Announced HERE, as `sameDocument` is: the page's `navigated` goes
             # up before a wait this commit ends is answered. ⛔ Sent from the

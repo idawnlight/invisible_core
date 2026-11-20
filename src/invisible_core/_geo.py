@@ -508,14 +508,6 @@ def _host_is_ipv6_only() -> bool:
     return False
 
 
-# How long a direct measurement of the egress is kept and shared. The wrapper
-# rechecks the exit of a running session on the same interval
-# (`_INTERVALLO_CONTROLLO_USCITA_S`, 120.0, in invisible_playwright), so a launch
-# never sees an answer older than the longest age the wrapper itself accepts.
-_EGRESS_SHARED_FOR_S = 120.0
-_egress_clock = time.monotonic  # a seam for the tests
-
-
 class _Flight:
     """One direct measurement in progress, and what the callers waiting on it get."""
 
@@ -526,7 +518,6 @@ class _Flight:
 
 
 _egress_lock = threading.Lock()
-_egress_kept: "Optional[tuple[str, float]]" = None   # (ip, valid until)
 _egress_flight: Optional[_Flight] = None
 
 
@@ -539,25 +530,18 @@ def discover_egress_ip(
     """Return the public egress IP. See :func:`_measure_egress_ip` for how it is
     measured and what it raises.
 
-    ⛔ WITHOUT A PROXY the measurement is made ONCE for the whole process: launches
-    that ask at the same moment wait for the one request in flight instead of
-    making their own, and the answer is kept for ``_EGRESS_SHARED_FOR_S`` seconds,
-    so a launch inside that interval makes no request at all. A failure is not
-    kept - the next call measures again - and every caller waiting on that
-    measurement gets the same error.
+    ⛔ NOTHING IS KEPT: every launch asks again, so what the exit costs is seen on each one. WITHOUT A PROXY, launches
+    that ask at the SAME MOMENT wait for the one request in flight instead of making their own; the flight ends with
+    the request and holds no answer after it. A failure is the same for every caller waiting on that request.
 
-    WITH A PROXY nothing is shared and nothing is kept: a rotating proxy answers
-    with a different exit for every connection, so each request is its own
-    measurement. Nor do they queue: requests through proxies run side by side.
+    WITH A PROXY nothing is shared: a rotating proxy answers with a different exit for every connection, so each
+    request is its own measurement. Nor do they queue: requests through proxies run side by side.
     """
     if proxy:
         return _measure_egress_ip(proxy, timeout=timeout, budget=budget)
 
-    global _egress_kept, _egress_flight
+    global _egress_flight
     with _egress_lock:
-        kept = _egress_kept
-        if kept is not None and _egress_clock() < kept[1]:
-            return kept[0]
         flight = _egress_flight
         leader = flight is None
         if leader:
@@ -576,8 +560,6 @@ def discover_egress_ip(
         raise
     finally:
         with _egress_lock:
-            if flight.ip is not None:
-                _egress_kept = (flight.ip, _egress_clock() + _EGRESS_SHARED_FOR_S)
             _egress_flight = None
         flight.done.set()
     return flight.ip
@@ -1055,8 +1037,6 @@ def prepare_session_geo(
     except Exception as exc:  # noqa: BLE001
         egress_err = exc
     udp_exit = pending.result(egress_ip) if pending is not None else None
-    if egress_ip is not None:
-        _udp_exit.remember(proxy, udp_exit, stun_servers)   # a context given this proxy later does not measure it again
 
     # Timezone resolution - the precedence of the module docstring.
     def _coordinate(ip: "Optional[str]") -> "Optional[DeclaredPosition]":

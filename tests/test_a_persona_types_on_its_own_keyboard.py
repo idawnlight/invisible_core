@@ -152,7 +152,9 @@ def test_the_us_keyboard_sends_firefox_s_key_codes():
 
 def test_the_us_keyboard_is_the_default_and_the_module_closure():
     c, kb = _kb()
-    assert kb.layout == "us" and kb._closure is LAYOUT_CLOSURE
+    # The core keeps no closure between two builds, so the default keyboard's is built again and EQUAL to the module's
+    # constant (the one built at import), not the same object.
+    assert kb.layout == "us" and kb._closure == LAYOUT_CLOSURE and kb._closure is not LAYOUT_CLOSURE
     kb.press("@")
     assert _downs(c.events) == [("Shift", "ShiftLeft", 16), ("@", "Digit2", 50)]
 

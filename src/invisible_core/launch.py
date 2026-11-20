@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from . import _engine_env
 from . import environment
 from ._headless import DESKTOP_ENV
+from .constants import INTERMEDIATES_PREF
 from ._webrtc_network import network_to_declare
 
 
@@ -71,6 +72,16 @@ def write_user_js(profile_dir: "str | os.PathLike[str]", prefs: Dict[str, Any]) 
     first real run. Bytes, not text: a text-mode write on Windows translates
     every newline, and a prefs file is read by the browser, not by git.
     """
+    # ⛔ THE PRELOADED INTERMEDIATES FILE IS DECLARED HERE, AND ONLY HERE: this is the one writer, so every launch of the core and of the wrapper passes
+    # through it exactly once, and the pref has one author. The cached file is a fact of the machine, not of the seed, so no composer of prefs knows it.
+    # A pref the caller already gave wins (and nothing is fetched); a cold cache downloads in line; with no list and no network there is NO line and the
+    # warning is said once (`_intermediates.ensure_intermediates`). A launch checks for no newer list: that is `fetch`'s job (`_intermediates.update_intermediates`).
+    if INTERMEDIATES_PREF not in prefs:
+        from ._intermediates import ensure_intermediates
+
+        listing = ensure_intermediates()
+        if listing is not None:
+            prefs = {**prefs, INTERMEDIATES_PREF: str(listing)}
     d = Path(profile_dir)
     d.mkdir(parents=True, exist_ok=True)
     out = d / "user.js"

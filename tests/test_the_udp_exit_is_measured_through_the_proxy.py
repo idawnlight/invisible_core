@@ -381,8 +381,8 @@ def test_the_first_pipe_command_of_a_socks5_launch_carries_the_measure(declared,
     for mapped, expected in ((EXIT, "coherent"), (OTHER, "no")):
         servers = declared(mapped)
         with UdpGateway() as gw:
-            prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
-            browser = _first_pipe_command(monkeypatch, _udp_exit.launch_proxy_command(gw.proxy, servers))
+            geo = prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
+            browser = _first_pipe_command(monkeypatch, _udp_exit.launch_proxy_command(gw.proxy, udp_exit=geo.udp_exit))
         assert browser.methods[:2] == ["Browser.setBrowserProxy", "Browser.enable"]
         assert browser.params["Browser.setBrowserProxy"]["udp"] == expected
 
@@ -406,8 +406,8 @@ def test_no_stun_address_reaches_the_browser(declared, monkeypatch, tmp_path):
     servers = declared(EXIT)
     needles = list(servers)        # "ip:port" (the proxy is on the same loopback address, so the bare IP proves nothing)
     with UdpGateway() as gw:
-        prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
-        browser = _first_pipe_command(monkeypatch, _udp_exit.launch_proxy_command(gw.proxy, servers))
+        geo = prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
+        browser = _first_pipe_command(monkeypatch, _udp_exit.launch_proxy_command(gw.proxy, udp_exit=geo.udp_exit))
     dumped = repr(browser.params) + repr(browser.seen)
     assert not [n for n in needles if n in dumped], "an address of the STUN list reached the pipe or the process"
     assert not [k for k in browser.seen["env"] if "STUN" in k.upper()]
@@ -431,9 +431,9 @@ def test_a_launch_proxy_written_with_udp_coherent_carries_the_measure_not_the_cl
     from invisible_core import prepare_session_geo
     servers = declared(OTHER)                      # the UDP exits elsewhere than the TCP
     with UdpGateway() as gw:
-        prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
+        geo = prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
         browser = _first_pipe_command(
-            monkeypatch, _udp_exit.launch_proxy_command(dict(gw.proxy, udp="coherent"), servers))
+            monkeypatch, _udp_exit.launch_proxy_command(dict(gw.proxy, udp="coherent"), udp_exit=geo.udp_exit))
     assert browser.params["Browser.setBrowserProxy"]["udp"] == "no"
 
 
@@ -476,29 +476,56 @@ def test_the_core_client_keeps_the_launch_servers_for_its_contexts():
     assert "udp_stun_servers" in inspect.signature(instance.Browser.__init__).parameters
 
 
-def test_one_proxy_is_measured_once_per_session_of_calls(declared):
+def test_a_proxy_is_measured_every_time_a_context_is_given_it(declared):
+    """Nothing is kept: two contexts given the same proxy are two measurements (two associations at the gateway)."""
     servers = declared(EXIT)
     with UdpGateway() as gw:
         first = _udp_exit.measure_proxy_udp(gw.proxy, servers)
+        assert gw.associates == 1
         second = _udp_exit.measure_proxy_udp(dict(gw.proxy), servers)
         assert first == second == "coherent"
-        assert gw.associates == 1, "cached by endpoint, a hash of the credentials and the servers"
+        assert gw.associates == 2, "the second context measured again: the core remembers no verdict"
 
 
-def test_the_cache_key_is_not_the_secret():
-    from invisible_core._proxy import parse_proxy
-    key = _udp_exit.cache_key(parse_proxy({"server": "socks5://h:1", "username": "a", "password": "hunter2-xyz"}))
-    assert "hunter2-xyz" not in repr(key)
-    other = _udp_exit.cache_key(parse_proxy({"server": "socks5://h:1", "username": "a", "password": "other"}))
-    assert key != other
+def test_two_contexts_with_one_proxy_make_two_measurements_through_the_core_client(declared):
+    import types
+    from invisible_core.juggler.instance import Browser
+    sent = []
+    fake = types.SimpleNamespace(ENGINE_OPTIONS=Browser.ENGINE_OPTIONS, udp_stun_servers=declared(EXIT),
+                                 context_send=lambda method, params, **kw: sent.append((method, params)))
+    with UdpGateway() as gw:
+        Browser.apply_context_options(fake, "ctx-1", {"proxy": gw.proxy})
+        Browser.apply_context_options(fake, "ctx-2", {"proxy": gw.proxy})
+        assert gw.associates == 2
+    assert [p["udp"] for m, p in sent if m == "Browser.setContextProxy"] == ["coherent", "coherent"]
 
 
 # the launch of a client that composed no session ----------------------------------------------------------
-def test_a_launch_proxy_gets_what_the_geo_step_remembered_and_asks_no_network(declared):
+def test_a_launch_proxy_gets_the_verdict_it_is_handed_and_asks_no_network(declared):
+    from invisible_core import prepare_session_geo
+    servers = declared(EXIT)
+    with UdpGateway() as gw:
+        geo = prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
+        assert geo.udp_exit == "coherent"
+        before = gw.associates
+        assert _udp_exit.launch_proxy_command(dict(gw.proxy), udp_exit=geo.udp_exit)["udp"] == "coherent"
+        assert _udp_exit.launch_proxy_command(dict(gw.proxy), udp_exit="no")["udp"] == "no", "the verdict passed is the one declared"
+        assert gw.associates == before, "the network was not asked"
+
+
+def test_a_launch_proxy_with_no_verdict_is_unmeasured_whatever_was_measured_before(declared):
+    """The core keeps no verdict: a measurement made a moment ago for this very proxy is not read back."""
     from invisible_core import prepare_session_geo
     servers = declared(EXIT)
     with UdpGateway() as gw:
         assert prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers).udp_exit == "coherent"
-        before = gw.associates
-        assert _udp_exit.launch_proxy_command(dict(gw.proxy), servers)["udp"] == "coherent"
-        assert gw.associates == before, "the network was not asked a second time"
+        assert _udp_exit.launch_proxy_command(dict(gw.proxy))["udp"] == "unmeasured"
+        assert _udp_exit.launch_proxy_command(dict(gw.proxy), udp_exit=None)["udp"] == "unmeasured"
+
+
+def test_the_verdict_is_named_so_an_old_positional_call_fails_loudly():
+    """Until 67.77.0 the second argument of launch_proxy_command was the STUN servers; a caller still passing them by position would have its list
+    declared as the UDP verdict. The verdict is keyword-only, so that call is a TypeError instead of a wrong proxy command."""
+    with pytest.raises(TypeError):
+        _udp_exit.launch_proxy_command({"server": "socks5://10.0.0.1:1080"}, ["192.0.2.1:3478"])
+    assert _udp_exit.launch_proxy_command({"server": "socks5://10.0.0.1:1080"}, udp_exit="no")["udp"] == "no"

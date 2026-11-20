@@ -3,7 +3,7 @@
 A page behind a proxy that grants SOCKS5 UDP ASSOCIATE, but whose UDP leaves from an address other than the TCP
 exit, sees a server-reflexive candidate that is not the address of its HTTP: the classic leak. A home line has ONE
 address. So the exit discovery the core already makes for the TCP side (:func:`invisible_core._geo.discover_egress_ip`:
-address, zone, city) also measures the UDP side through the same proxy, once per proxy, and the answer travels IN THE
+address, zone, city) also measures the UDP side through the same proxy, and the answer travels IN THE
 PROXY DECLARATION on the pipe: the optional field ``udp`` of ``Browser.setBrowserProxy`` and
 ``Browser.setContextProxy``, one of
 
@@ -50,7 +50,6 @@ to the browser's environment, argv, prefs or pipe.
 """
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import logging
 import os
@@ -82,10 +81,6 @@ NO = "no"
 UNMEASURED = "unmeasured"
 #: The values of the ``udp`` field.
 VALUES = UDP_EXIT_VALUES
-
-#: How long a proxy's measurement is kept (seconds): for a context that gives the proxy again, and for the launch that
-#: measured it to reach the engine's first command even after a first-run download.
-CACHE_SECONDS = 1800.0
 
 _MAGIC = b"\x21\x12\xa4\x42"
 _BINDING_REQUEST = b"\x00\x01\x00\x00" + _MAGIC
@@ -391,46 +386,19 @@ def start_measurement(proxy: Optional[Dict[str, Any]],
     return PendingMeasurement(endpoint, servers, BUDGET, SCHEDULE)
 
 
-# ── once per proxy ──────────────────────────────────────────────────────────
-def cache_key(endpoint: ProxyEndpoint, servers: Tuple[Server, ...] = ()) -> Tuple[Any, ...]:
-    """The endpoint, a hash of the credentials (never the secret itself) and the servers asked."""
-    # chr(0) separates username and password unambiguously without a C0 string literal.
-    secret = hashlib.sha256(f"{endpoint.username}{chr(0)}{endpoint.password}".encode("utf-8")).hexdigest()
-    return (endpoint.type, endpoint.host, endpoint.port, secret, tuple(servers))
-
-
-_cache: Dict[Tuple[Any, ...], Tuple[float, Optional[str]]] = {}
-_cache_lock = threading.Lock()
-
-
-def remember(proxy: Optional[Dict[str, Any]], verdict: Optional[str],
-             udp_stun_servers: Optional[Sequence[Any]] = None) -> None:
-    """Keep a measurement the launch already made, so a context given the same proxy does not repeat it."""
-    servers = stun_servers(udp_stun_servers)
-    endpoint = _endpoint_to_measure(proxy)
-    if endpoint is not None and verdict is not None:
-        with _cache_lock:
-            _cache[cache_key(endpoint, servers)] = (time.monotonic(), verdict)
-
-
+# ── what a context's proxy costs ────────────────────────────────────────────
 def measure_proxy_udp(proxy: Optional[Dict[str, Any]],
                       udp_stun_servers: Optional[Sequence[Any]] = None) -> Optional[str]:
     """The ``udp`` field to declare for ``proxy``, discovering what it needs: the TCP exit through the proxy (the
-    core's own discovery) and, beside it, the UDP exit. ONCE per proxy (endpoint and a hash of the credentials) for
-    :data:`CACHE_SECONDS`. None for a proxy that is not SOCKS5.
+    core's own discovery) and, beside it, the UDP exit. None for a proxy that is not SOCKS5.
 
-    For a proxy given to a context (``new_context(proxy=...)``): called BEFORE ``Browser.setContextProxy`` is sent. It
-    costs the TCP discovery (one to three round trips through the proxy) with the UDP measurement beside it, so
-    about the time of the longer of the two; nothing at all the second time."""
+    ⛔ NOTHING IS KEPT: every call measures, so a cost is a call that can be seen. For a proxy given to a context
+    (``new_context(proxy=...)``): called BEFORE ``Browser.setContextProxy`` is sent. It costs the TCP discovery (one
+    to three round trips through the proxy) with the UDP measurement beside it, so about the time of the longer of
+    the two, every time."""
     servers = stun_servers(udp_stun_servers)
-    endpoint = _endpoint_to_measure(proxy)
-    if endpoint is None:
+    if _endpoint_to_measure(proxy) is None:
         return None
-    key = cache_key(endpoint, servers)
-    with _cache_lock:
-        hit = _cache.get(key)
-    if hit is not None and time.monotonic() - hit[0] < CACHE_SECONDS:
-        return hit[1]
     from . import _geo
     pending = start_measurement(proxy, servers)
     exit_ip: Optional[str] = None
@@ -438,10 +406,7 @@ def measure_proxy_udp(proxy: Optional[Dict[str, Any]],
         exit_ip = _geo.discover_egress_ip(proxy)
     except Exception:  # noqa: BLE001 - without the TCP exit nothing can be compared: unmeasured
         exit_ip = None
-    verdict = pending.result(exit_ip) if pending is not None else None
-    if exit_ip is not None:          # a comparison that could not be made is not kept
-        remember(proxy, verdict, servers)
-    return verdict
+    return pending.result(exit_ip) if pending is not None else None
 
 
 def _command(proxy: Dict[str, Any], udp: Any) -> Optional[Dict[str, Any]]:
@@ -467,19 +432,14 @@ def context_proxy_command(proxy: Dict[str, Any],
     return _command(proxy, measure_proxy_udp(proxy, udp_stun_servers) or UNMEASURED)
 
 
-def launch_proxy_command(proxy: Dict[str, Any],
-                         udp_stun_servers: Optional[Sequence[Any]] = None) -> Optional[Dict[str, Any]]:
+def launch_proxy_command(proxy: Dict[str, Any], *, udp_exit: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """The params of ``Browser.setBrowserProxy`` for ``proxy``, WITHOUT touching the network.
 
-    The measurement belongs to the launch's geo step (``prepare_session_geo``, beside the TCP discovery), which
-    remembers it for the proxy and the servers it asked; this renders the command with what was remembered, and
-    ``unmeasured`` when nothing was (a client that composed no session, an entry that expired): never ``coherent``
-    without a measurement. Whatever the caller wrote under ``udp`` is not read."""
+    The measurement belongs to the launch's geo step (``prepare_session_geo``, beside the TCP discovery): its verdict
+    (``SessionGeo.udp_exit``) is the ``udp_exit`` argument, handed here by whoever launches. ``unmeasured`` when none
+    is given (a client that composed no session): never ``coherent`` without a measurement. Whatever the caller wrote
+    under ``udp`` is not read."""
     endpoint = parse_proxy(proxy)
     if endpoint is None or endpoint.type != "socks":
         return _command(proxy, None)
-    servers = stun_servers(udp_stun_servers)
-    with _cache_lock:
-        hit = _cache.get(cache_key(endpoint, servers))
-    fresh = hit is not None and time.monotonic() - hit[0] < CACHE_SECONDS
-    return _command(proxy, (hit[1] if fresh else None) or UNMEASURED)
+    return _command(proxy, udp_exit or UNMEASURED)

@@ -27,6 +27,10 @@ list of tests:
   5. A run is red on a failure, on a SKIPPED test, on a part that ran no file it
      was given, and on a run that ran nothing; a failed attempt that was run again
      is not a skip.
+  6. The wrapper the job installs is its `main`, or, on a pull request whose body has
+     the line `wrapper-ref: <branch>`, that branch (it must exist; a bad line, two
+     lines or a missing branch is red; a push and a tag are always `main`). The body
+     reaches the script through `env:`, never through an interpolation.
 
 Every check is also run on a known-bad input first: a check that has only ever
 said "fine" is not known to be able to say anything else.
@@ -131,15 +135,28 @@ def job_problems(spec: dict) -> list[str]:
         out.append("the pin is not left alone (INVISIBLE_CORE_PIN=allow, INVISIBLE_CORE_AUTOFIX=off)")
     steps = job.get("steps") or []
     text = "\n".join(str(s.get("run", "")) for s in steps)
-    if not any(s.get("with", {}).get("repository") == "oss-invisible/playwright"
-               and s.get("with", {}).get("ref") == "main" for s in steps):
-        out.append("the wrapper's main is not checked out")
+    checkouts = [s for s in steps if (s.get("with") or {}).get("repository") == "oss-invisible/playwright"]
+    chooser = [s for s in steps if "wrapper_on_this_core.py wrapper-ref" in str(s.get("run", ""))]
+    if len(checkouts) != 1:
+        out.append("the wrapper is not checked out exactly once")
+    elif (len(chooser) != 1 or not chooser[0].get("id")
+          or _bare(checkouts[0]["with"].get("ref")) != f"steps.{chooser[0]['id']}.outputs.ref"
+          or steps.index(chooser[0]) > steps.index(checkouts[0])):
+        out.append("the wrapper's checkout does not take its ref from the output of the step that chooses it")
     for needle, what in (("pip install --force-reinstall --no-deps .", "this core is not installed over the pin"),
                          ("wrapper_on_this_core.py compare", "the list is not compared with main's"),
                          ("wrapper_on_this_core.py\" engine", "the engine of the seal is not fetched and checked"),
                          ("wrapper_on_this_core.py run", "the tests are not run")):
         if needle not in text:
             out.append(what)
+    # This core is installed BEFORE the wrapper: a declared wrapper branch pins this release, which the index does not
+    # have yet, and pip must find it installed (run 44651554169: "No matching distribution found for invisible-core==67.78.0").
+    install = next((str(s.get("run", "")) for s in steps if 'pip install ".[dev]"' in str(s.get("run", ""))), "")
+    lines = [line.strip() for line in install.splitlines()]
+    first_core = next((i for i, line in enumerate(lines) if line == "python -m pip install ."), None)
+    wrapper_line = next((i for i, line in enumerate(lines) if 'pip install ".[dev]"' in line), None)
+    if first_core is None or wrapper_line is None or first_core > wrapper_line:
+        out.append("this core is not installed before the wrapper (a declared wrapper branch pins a core the index does not have yet)")
     run_step = next((s for s in steps if "wrapper_on_this_core.py run" in str(s.get("run", ""))), {})
     if run_step.get("timeout-minutes") != 12:
         out.append("the test step is not held to 12 minutes")
@@ -147,6 +164,17 @@ def job_problems(spec: dict) -> list[str]:
         out.append("a leg is not told how many parts there are (--parts from the matrix)")
     if "xvfb-run" not in text:
         out.append("Linux does not run under a virtual display")
+    # The body of the pull request is untrusted: it reaches a script only through `env:`.
+    for name in (JOB, "wrapper-job-needed"):
+        for step in (jobs.get(name) or {}).get("steps") or []:
+            if re.search(r"\$\{\{[^}]*pull_request\.body", str(step.get("run", ""))):
+                out.append(f"the body of the pull request is interpolated in the `run:` of a step of `{name}`")
+    if len(chooser) == 1:
+        body_vars = [k for k, v in (chooser[0].get("env") or {}).items() if "github.event.pull_request.body" in str(v)]
+        if not body_vars:
+            out.append("the body of the pull request does not reach the chooser through `env:`")
+        elif not any(f'"${k}"' in str(chooser[0].get("run", "")) for k in body_vars):
+            out.append("the chooser step does not read the body from its environment variable")
     return out
 
 
@@ -501,7 +529,7 @@ def _decide_script() -> str:
     return step["run"]
 
 
-def _decide(tmp_path, event, head_ref, changed):
+def _decide(tmp_path, event, head_ref, changed, body=""):
     """Runs the `decide` step in a throwaway repo where the head commit changes ``changed``."""
     import shutil
     import subprocess
@@ -531,7 +559,7 @@ def _decide(tmp_path, event, head_ref, changed):
     out.write_text("", encoding="utf-8")
     script = tmp_path / "decide.sh"
     script.write_text(_decide_script(), encoding="utf-8", newline="\n")
-    env = dict(__import__("os").environ, EVENT=event, HEAD_REF=head_ref, BASE_SHA=base, HEAD_SHA=head,
+    env = dict(__import__("os").environ, EVENT=event, HEAD_REF=head_ref, BASE_SHA=base, HEAD_SHA=head, PR_BODY=body,
                RUNNER_TEMP=str(tmp_path), GITHUB_OUTPUT=str(out))
     done = subprocess.run([bash, str(script)], cwd=repo, env=env, capture_output=True, text=True)
     return done, out.read_text(encoding="utf-8").strip()
@@ -684,3 +712,225 @@ def test_an_exclusion_whose_file_is_gone_or_has_no_witness_is_red(tmp_path):
         assert any("no witness" in f for f in mod.witness_problems(_wrapper_tree(tmp_path / "b"), "windows", "firefox-64"))
     finally:
         mod.WITNESSES.update(saved)
+
+
+# ------------------------------------------- which branch of the wrapper the job tries
+#
+# `main`, unless the body of a PULL REQUEST declares `wrapper-ref: <branch>` (one line, the
+# branch must exist in the wrapper's repository). The `ls-remote` is a stand-in here.
+
+def _remote(*branches):
+    """A stand-in for `git ls-remote --heads <wrapper> refs/heads/<branch>`: answers as git does."""
+    def ls_remote(branch):
+        return "".join(f"{'a' * 40}\trefs/heads/{b}\n" for b in branches if b == branch)
+    return ls_remote
+
+
+def _no_network(branch):
+    raise AssertionError(f"the wrapper's repository was asked about {branch!r}: it must not be")
+
+
+def test_a_pull_request_without_the_line_tries_the_wrappers_main():
+    mod = _load_script()
+    for body in (None, "", "Fixes the thing.\n\nNo declaration here.\n",
+                 "  wrapper-ref: feat/x\n",                      # not at the start of the line: ordinary text
+                 "see wrapper-ref: feat/x in the other pr\n"):
+        ref, why = mod.choose_wrapper_ref("pull_request", body, _no_network)
+        assert ref == "main", body
+        assert "main" in why
+
+
+def test_a_pull_request_that_declares_an_existing_branch_tries_that_branch(tmp_path, monkeypatch):
+    mod = _load_script()
+    remote = _remote("main", "feat/x", "fix/a.b_c-1")
+    for body, want in (("wrapper-ref: feat/x", "feat/x"),
+                       ("Intro\r\n\r\nwrapper-ref: feat/x\r\nmore text\r\n", "feat/x"),     # the web form writes CRLF
+                       ("wrapper-ref: fix/a.b_c-1\n", "fix/a.b_c-1"),
+                       ("wrapper-ref: main", "main")):
+        ref, why = mod.choose_wrapper_ref("pull_request", body, remote)
+        assert ref == want and want in why
+    # the command: the ref goes to the step output, the reason names the branch in the summary
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("Text\n\nwrapper-ref: feat/x\n", encoding="utf-8")
+    out, summary = tmp_path / "out.txt", tmp_path / "summary.md"
+    monkeypatch.setattr(mod, "_ls_remote_heads", remote)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert mod.main(["wrapper-ref", "--event", "pull_request", "--body-file", str(body_file)]) == 0
+    assert out.read_text(encoding="utf-8") == "ref=feat/x\n"
+    assert "feat/x" in summary.read_text(encoding="utf-8")
+
+
+def test_the_default_is_written_to_the_output_and_to_the_summary_too(tmp_path, monkeypatch, capsys):
+    mod = _load_script()
+    out, summary = tmp_path / "out.txt", tmp_path / "summary.md"
+    monkeypatch.setattr(mod, "_ls_remote_heads", _no_network)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert mod.main(["wrapper-ref", "--event", "pull_request"]) == 0      # no body file at all
+    assert out.read_text(encoding="utf-8") == "ref=main\n"
+    assert "main" in summary.read_text(encoding="utf-8")
+    assert capsys.readouterr().out.strip() == "main"
+
+
+@pytest.mark.parametrize("line, reason", [
+    ("wrapper-ref:", "malformed"),                       # empty
+    ("wrapper-ref: ", "malformed"),                      # empty after the space
+    ("wrapper-ref:feat/x", "malformed"),                 # no space
+    ("wrapper-ref:  feat/x", "malformed"),               # two spaces
+    ("wrapper-ref: feat/x ", "malformed"),               # trailing space
+    ("wrapper-ref: feat x", "malformed"),                # a space inside
+    ("wrapper-ref: feat/x extra", "malformed"),
+    ("wrapper-ref: feat/x;rm -rf", "malformed"),         # characters that are not allowed
+    ("wrapper-ref: $(id)", "malformed"),
+    ("wrapper-ref: feat/*", "malformed"),
+    ("wrapper-ref: feat~1", "malformed"),
+    ("wrapper-ref: feat\"x", "malformed"),
+    ("Wrapper-Ref: feat/x", "malformed"),                # the grammar is lower case
+    ("wrapper-ref : feat/x", "malformed"),
+    ("wrapper-ref: -feat", "not a valid branch name"),
+    ("wrapper-ref: /feat", "not a valid branch name"),
+    ("wrapper-ref: feat/", "not a valid branch name"),
+    ("wrapper-ref: feat..x", "not a valid branch name"),
+    ("wrapper-ref: feat//x", "not a valid branch name"),
+    ("wrapper-ref: feat.lock", "not a valid branch name"),
+    ("wrapper-ref: gone/branch", "does not exist"),      # well formed, not in the wrapper's repository
+    ("wrapper-ref: feat", "does not exist"),             # `feat/x` exists, `feat` does not: no prefix match
+])
+def test_a_bad_line_is_red_with_the_reason(line, reason, tmp_path, monkeypatch, capsys):
+    mod = _load_script()
+    remote = _remote("main", "feat/x")
+    with pytest.raises(mod.WrapperRefError, match=reason):
+        mod.choose_wrapper_ref("pull_request", f"text\n{line}\nmore\n", remote)
+    body_file = tmp_path / "body.txt"
+    body_file.write_text(f"text\n{line}\n", encoding="utf-8")
+    out, summary = tmp_path / "out.txt", tmp_path / "summary.md"
+    monkeypatch.setattr(mod, "_ls_remote_heads", remote)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert mod.main(["wrapper-ref", "--event", "pull_request", "--body-file", str(body_file)]) == 1
+    assert reason in capsys.readouterr().err
+    assert not out.exists()                                # no ref is chosen
+    assert "RED" in summary.read_text(encoding="utf-8")
+
+
+def test_two_lines_are_red_even_if_both_are_fine():
+    mod = _load_script()
+    remote = _remote("feat/x", "feat/y")
+    for body in ("wrapper-ref: feat/x\nwrapper-ref: feat/y\n", "wrapper-ref: feat/x\ntext\nwrapper-ref: feat/x\n",
+                 "wrapper-ref: feat/x\nwrapper-ref:\n"):
+        with pytest.raises(mod.WrapperRefError, match="2 `wrapper-ref:` lines"):
+            mod.choose_wrapper_ref("pull_request", body, remote)
+
+
+def test_a_wrapper_repository_that_cannot_be_asked_is_red_not_main(monkeypatch):
+    import subprocess
+    mod = _load_script()
+
+    def boom(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="fatal: unable to access")
+
+    monkeypatch.setattr(mod.subprocess, "run", boom)
+    with pytest.raises(mod.WrapperRefError, match="cannot ask .* for its branches"):
+        mod.choose_wrapper_ref("pull_request", "wrapper-ref: feat/x\n")
+
+
+def test_ls_remote_is_asked_for_the_exact_branch_of_the_wrapper(monkeypatch):
+    import subprocess
+    mod = _load_script()
+    seen = []
+
+    def fake(cmd, **kwargs):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{'b' * 40}\trefs/heads/feat/x\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake)
+    assert mod.choose_wrapper_ref("pull_request", "wrapper-ref: feat/x\n")[0] == "feat/x"
+    assert seen == [["git", "ls-remote", "--heads", "https://github.com/oss-invisible/playwright", "refs/heads/feat/x"]]
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule", "release"])
+def test_a_push_a_tag_and_every_other_event_try_main_and_ignore_the_line(event):
+    mod = _load_script()
+    for body in ("wrapper-ref: feat/x\n", "wrapper-ref: not a branch\nwrapper-ref: b\n", None):
+        ref, why = mod.choose_wrapper_ref(event, body, _no_network)
+        assert ref == "main" and "not read" in why
+
+
+# ---- the workflow: the checkout takes the output, the body is only in `env:`, one step
+
+@_requires_pypi_ci
+def test_the_wrapper_checkout_takes_the_ref_from_the_step_that_chooses_it():
+    spec = _spec()
+    steps = spec["jobs"][JOB]["steps"]
+    chooser = [s for s in steps if "wrapper_on_this_core.py wrapper-ref" in str(s.get("run", ""))]
+    assert len(chooser) == 1
+    assert _bare(chooser[0]["env"]["EVENT"]) == "github.event_name"
+    assert "github.event.pull_request.body" in str(list(chooser[0]["env"].values()))
+    assert '--event "$EVENT"' in chooser[0]["run"]
+    checkout = next(s for s in steps if (s.get("with") or {}).get("repository") == "oss-invisible/playwright")
+    assert _bare(checkout["with"]["ref"]) == f"steps.{chooser[0]['id']}.outputs.ref"
+    assert steps.index(chooser[0]) < steps.index(checkout)
+    # the wrapper is checked out here and nowhere else in the workflow
+    others = [name for name, j in spec["jobs"].items() for s in j.get("steps") or []
+              if (s.get("with") or {}).get("repository") == "oss-invisible/playwright"]
+    assert others == [JOB]
+    assert job_problems(spec) == []
+
+
+@_requires_pypi_ci
+def test_a_workflow_that_checks_out_main_or_interpolates_the_body_is_caught():
+    spec = _spec()
+    steps = spec["jobs"][JOB]["steps"]
+    next(s for s in steps if (s.get("with") or {}).get("repository") == "oss-invisible/playwright")["with"]["ref"] = "main"
+    assert any("take its ref from the output" in p for p in job_problems(spec))
+    spec = _spec()
+    chooser = next(s for s in spec["jobs"][JOB]["steps"] if "wrapper-ref" in str(s.get("run", "")))
+    chooser["run"] = "echo '${{ github.event.pull_request.body }}' > body.txt\n" + chooser["run"]
+    assert any("interpolated" in p for p in job_problems(spec))
+    spec = _spec()
+    spec["jobs"][JOB]["steps"] = [s for s in spec["jobs"][JOB]["steps"] if "wrapper-ref" not in str(s.get("run", ""))]
+    assert any("take its ref from the output" in p for p in job_problems(spec))
+    spec = _spec()
+    next(s for s in spec["jobs"][JOB]["steps"] if "wrapper-ref" in str(s.get("run", "")))["env"].pop("PR_BODY")
+    assert any("through `env:`" in p for p in job_problems(spec))
+
+
+@_requires_pypi_ci
+def test_the_body_reaches_the_script_by_env_and_a_hostile_body_is_inert(tmp_path):
+    """Runs the real step: a body full of shell syntax is written to the file byte for byte, and what the
+    script makes of it is a refusal (a malformed line), never an execution."""
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("no bash on this machine")
+    step = next(s for s in _spec()["jobs"][JOB]["steps"] if s.get("id") == "wrapper_ref")
+    assert "${{" not in step["run"]
+    script = tmp_path / "step.sh"
+    script.write_text(step["run"].replace("scripts/wrapper_on_this_core.py", SCRIPT.as_posix()), encoding="utf-8", newline="\n")
+    marker = tmp_path / "pwned"
+    hostile = f"x'; touch {marker.as_posix()} #\n$(touch {marker.as_posix()})\n`touch {marker.as_posix()}`\nwrapper-ref: a b\n"
+    out = tmp_path / "out.txt"
+    env = dict(os.environ, EVENT="pull_request", PR_BODY=hostile, RUNNER_TEMP=tmp_path.as_posix(), GITHUB_OUTPUT=str(out))
+    done = subprocess.run([bash, str(script)], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert done.returncode == 1 and "malformed" in done.stderr, (done.stdout, done.stderr)
+    assert (tmp_path / "pr_body.txt").read_bytes() == hostile.encode("utf-8")
+    assert not marker.exists()
+    # and a push, with the same body, gives main
+    env.update(EVENT="push")
+    done = subprocess.run([bash, str(script)], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert done.returncode == 0 and out.read_text(encoding="utf-8") == "ref=main\n", done.stderr
+
+
+@_requires_pypi_ci
+def test_a_pull_request_that_declares_a_wrapper_branch_makes_the_job_needed(tmp_path):
+    step = next(x for x in _spec()["jobs"]["wrapper-job-needed"]["steps"] if x.get("id") == "decide")
+    assert "PR_BODY" in step["env"] and "${{" not in step["run"]
+    for n, (body, expected) in enumerate([("", "run=false"), ("nothing to see\n", "run=false"),
+                                          ("wrapper-ref: feat/x\n", "run=true"),
+                                          ("a\r\nwrapper-ref: feat/x\r\n", "run=true"),
+                                          ("see wrapper-ref: feat/x\n", "run=false")]):
+        done, out = _decide(tmp_path / str(n), "pull_request", "fix/x", ["src/other.py"], body=body)
+        assert done.returncode == 0, done.stderr
+        assert out == expected, (body, out)

@@ -101,16 +101,12 @@ _EXT2 = (
 # which we no longer gate.
 _ENABLED = True
 _POOL_PATH = __import__("pathlib").Path(__file__).parent / "_fpforge" / "data" / "webgl_gpu_pool.json"
-_GPU_POOL_CACHE: Optional[List[Dict]] = None
 
 
 def _gpu_pool() -> List[Dict]:
-    """Lazy-load the Windows GPU pool (we always claim Windows). Each entry:
+    """Load the Windows GPU pool (we always claim Windows), from the file on EVERY call: nothing is kept. Each entry:
     {key, renderer (input form), vendor, gpu_class (via classify_gpu), prefs (full
     zoom.stealth.webgl.* override dict), weight (real per-OS prevalence)}."""
-    global _GPU_POOL_CACHE
-    if _GPU_POOL_CACHE is not None:
-        return _GPU_POOL_CACHE
     import json
     from ._fpforge._sampler import classify_gpu  # lazy import → no module cycle
     raw = json.loads(_POOL_PATH.read_text(encoding="utf-8"))
@@ -131,7 +127,6 @@ def _gpu_pool() -> List[Dict]:
             # real GPU the entry stands for (a label of win_gfx_devices.json)
             "device": e.get("device"),
         })
-    _GPU_POOL_CACHE = pool
     return pool
 
 
@@ -298,15 +293,11 @@ def persona_for(renderer: str, vendor: str) -> Optional[Dict]:
 # Mozilla's MOZ_GFX_SPOOF_* variables (coord/gfxinfo). The engine answers
 # GetFeatureStatus from them on every host, so the host adapter decides nothing.
 _DEVICES_PATH = _POOL_PATH.with_name("win_gfx_devices.json")
-_DEVICES_CACHE: Optional[Dict[str, List[Dict]]] = None
 
 
 def _gfx_devices() -> Dict[str, List[Dict]]:
-    global _DEVICES_CACHE
-    if _DEVICES_CACHE is None:
-        import json
-        _DEVICES_CACHE = json.loads(_DEVICES_PATH.read_text(encoding="utf-8"))["by_renderer"]
-    return _DEVICES_CACHE
+    import json
+    return json.loads(_DEVICES_PATH.read_text(encoding="utf-8"))["by_renderer"]
 
 
 def choose_gfx_device(persona: Optional[Dict], seed: int) -> Optional[Dict]:

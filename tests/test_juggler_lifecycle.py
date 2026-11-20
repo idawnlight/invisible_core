@@ -492,6 +492,57 @@ def test_networkidle_is_born_once_and_announced_without_anyone_waiting():
     assert heard == announced, heard  # born once: nothing announced again
 
 
+def test_the_silence_before_a_document_commits_does_not_count_for_it(monkeypatch):
+    """⛔ networkidle's half second of quiet is the NEW document's, counted from its commit at the earliest, as in
+    Playwright (`Frame._onClearLifecycle` restarts the idle timer at the commit).
+
+    The known-bad input, from the wrapper's e2e `test_networkidle_is_reached_on_the_page_that_replaced_ours[/x50]`
+    (Windows, PR #535, run 44636883786): `goto(".../ix50", "networkidle")` returned with the page still on /ix50, a page
+    whose `load` handler opens a request the server holds and moves once its first bytes arrive. The parent finished
+    /ix50's document request, then the frame changed process: nothing reaches the client while the content process
+    is chosen and the document commits. The quiet was counted from that last request event, so the silence of the
+    process swap was already half a second when `load` arrived, and networkidle was born on `load` itself, before the
+    parent announced the held request of the page's `load` handler.
+
+    No clock: the lifecycle's clock is replaced by a counter the test moves."""
+    from invisible_core.juggler import lifecycle as lifecycle_module
+
+    now = [1000.0]
+    monkeypatch.setattr(lifecycle_module, "time", type("Clock", (), {"monotonic": staticmethod(lambda: now[0])}))
+    c, v = lifecycle()
+    events(v, ("Page.frameAttached", {"frameId": "F1"}),
+           ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N0"}),
+           ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N0", "url": "http://localhost/landed"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}),
+           # our goto: the document request, seen and ended in the parent
+           ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N1"}),
+           ("Network.requestWillBeSent", {"requestId": "D1", "frameId": "F1", "navigationId": "N1",
+                                          "url": "http://127.0.0.1/ix50"}),
+           ("Network.requestFinished", {"requestId": "D1"}))
+    now[0] += IDLE_QUIET * 1.2  # the process swap: no event
+    events(v, ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N1", "url": "http://127.0.0.1/ix50"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "DOMContentLoaded"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}))
+    assert "networkidle" not in v.frames["F1"].states, "the silence before the commit counted for the new document"
+
+    # the `load` handler's request, announced by the parent after `load`: held open until the page moves
+    events(v, ("Network.requestWillBeSent", {"requestId": "H", "frameId": "F1", "url": "http://127.0.0.1/hold"}))
+    now[0] += IDLE_QUIET * 10
+    events(v, ("Network.responseReceived", {"requestId": "H"}))
+    assert "networkidle" not in v.frames["F1"].states
+
+    # the page moves; networkidle is born on the document that replaced it
+    events(v, ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N2"}),
+           ("Network.requestFailed", {"requestId": "H"}),
+           ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N2", "url": "http://localhost/landed"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}))
+    assert "networkidle" not in v.frames["F1"].states
+    now[0] += IDLE_QUIET
+    events(v, ("Network.dataReceived", {"requestId": "nothing"}))  # any event runs the settle
+    assert "networkidle" in v.frames["F1"].states
+    assert v.frames["F1"].url == "http://localhost/landed"
+
+
 def test_a_same_document_goto_answers_after_the_engine_reports_it():
     """Upstream Playwright's `goto`, for a navigation that creates no
     document, waits for the frame's same-document navigation before it

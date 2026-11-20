@@ -1,4 +1,4 @@
-"""Launches that ask for the egress at the same moment share ONE measurement, and a direct answer is kept for two minutes.
+"""Launches that ask for the egress at the same moment share ONE measurement, and the answer is kept by nobody.
 
 ⛔ THE KNOWN-BAD, measured on GitHub runners with four browsers launched together in one process and no proxy: every launch made its own HTTPS request to an
 echo service, and each of them swapped urllib3's GLOBAL `allowed_gai_family` under one process-wide lock held for the whole request, so the four requests ran in
@@ -130,27 +130,21 @@ def test_four_concurrent_launches_measure_the_egress_once(real_network, servers,
     assert seconds < 2.5 * DELAY, f"the launches waited for each other: {seconds:.2f}s for a {DELAY}s echo"
 
 
-def test_a_launch_inside_the_interval_makes_no_request_and_one_after_it_does(real_network, servers, monkeypatch):
+def test_two_launches_one_after_the_other_ask_the_network_twice(real_network, servers, monkeypatch):
+    """Nothing is kept: the flight ends with the request, and the next launch asks again (and sees a changed exit)."""
     echo = servers(delay=0.0)
     monkeypatch.setattr(_geo, "_IP_ECHO_ENDPOINTS", (echo.url,))
-    now = [1000.0]
-    monkeypatch.setattr(_geo, "_egress_clock", lambda: now[0], raising=False)
 
     assert discover_egress_ip(None) == EXIT
     assert echo.hits == 1
 
-    now[0] += 119.0
     assert discover_egress_ip(None) == EXIT
-    assert echo.hits == 1, "a launch inside the interval asked the network"
+    assert echo.hits == 2, "a launch after the first answered from memory"
 
     echo.reply = "198.51.100.9"
-    now[0] += 2.0   # the interval is over
     assert discover_egress_ip(None) == "198.51.100.9"
-    assert echo.hits == 2
-
-
-def test_the_interval_is_the_one_the_wrapper_rechecks_the_exit_on():
-    assert _geo._EGRESS_SHARED_FOR_S == 120.0
+    assert echo.hits == 3
+    assert _geo._egress_flight is None, "the flight outlived its request"
 
 
 def test_a_failure_is_not_kept_and_every_waiter_gets_it(real_network, servers, monkeypatch):
@@ -220,7 +214,6 @@ def test_no_measurement_writes_urllib3_s_global_family(real_network, servers, mo
     try:
         assert discover_egress_ip(None) == EXIT
         assert echo.hits == 1
-        monkeypatch.setattr(_geo, "_egress_kept", None, raising=False)
         # The failing path too: a refused connection, then the IPv6-only probe.
         monkeypatch.setattr(_geo, "_IP_ECHO_ENDPOINTS", ("http://127.0.0.1:9/",))
         monkeypatch.setattr(_geo, "_IPV6_ECHO_ENDPOINTS", ("http://[::1]:9/",))

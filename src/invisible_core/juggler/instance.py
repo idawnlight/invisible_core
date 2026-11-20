@@ -137,12 +137,17 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
            args: Optional[List[str]] = None, headless: bool = True,
            proxy: Optional[Dict[str, str]] = None,
            ready_timeout: Optional[float] = 60.0,
-           udp_stun_servers: Optional[List[str]] = None) -> "Browser":
+           udp_stun_servers: Optional[List[str]] = None,
+           udp_exit: Optional[str] = None) -> "Browser":
     """Start the patched Firefox and hand back a `Browser` ready to open pages.
 
     `udp_stun_servers` (`"ip:port"` IPv4 literals; None = the two public defaults) is where a SOCKS5 proxy's UDP exit
     is measured from, for the session's proxy and for every context proxy it is later given. It is a parameter of
     this Python call alone: nothing of it reaches the browser's environment, argv, prefs or pipe.
+
+    `udp_exit` is the verdict the launch's geo step measured for `proxy` (`SessionGeo.udp_exit`: `coherent`, `no`,
+    `unmeasured`); it is what `Browser.setBrowserProxy` declares as `udp`. The core keeps no memory of it: a launch
+    that composed no session passes none, and the proxy is declared `unmeasured`, never `coherent`.
 
     `env` is the WHOLE environment the browser gets, or None to inherit this
     process's. ⛔ A given environment is not a patch on top of `os.environ`:
@@ -181,7 +186,7 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
         proxy_command = None
         if proxy:
             try:
-                proxy_command = launch_proxy_command(proxy, udp_stun_servers)
+                proxy_command = launch_proxy_command(proxy, udp_exit=udp_exit)
             except ValueError as exc:
                 raise EngineError("the proxy cannot be applied: %s" % exc)
         # ⛔ THE PROXY IS SET BY THE CORE'S `launch`, before any page exists,

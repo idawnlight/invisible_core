@@ -14,6 +14,10 @@ concurrency:
 
 env:
   GITHUB_TOKEN: ${{ github.token }}
+  # The preloaded-intermediates list every job launches with: ci/intermediates.json, a fixed file of this repository (empty, format 1, the sha256 in
+  # ci/intermediates.pin.json). With the variable set the core neither downloads Mozilla's list nor checks it, so no job here asks Mozilla for anything -
+  # wrapper-on-this-core included, which tests the wrapper's MAIN and its workflows' own fixed file. user-install.yml is the user's path and has none.
+  STEALTHFOX_INTERMEDIATES: ${{ github.workspace }}/ci/intermediates.json
 
 jobs:
   release-support:

@@ -1,0 +1,6 @@
+{
+  "comment": "The preloaded-intermediates list every job of ci.yml launches with (STEALTHFOX_INTERMEDIATES, set at the top of the workflow): EMPTY (format 1, no certificates), the same bytes as the wrapper's ci/intermediates.json, so no job asks Mozilla for the real list (the core neither downloads nor checks when the variable is set). To change it, change ci/intermediates.json and sha256 here in one commit; tests/test_ci_sets_the_intermediates_list.py fails when they differ.",
+  "file": "ci/intermediates.json",
+  "sha256": "f4f6a2332a4d589a1e8aaa4e73c820644a764125bb2970667afc7351e7cb3465",
+  "bytes": 219
+}

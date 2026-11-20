@@ -158,3 +158,32 @@ GEOIP_MMDB_NAME: str = "geoip-aio-all.mmdb"
 GEOIP_RELEASE_URL_TEMPLATE: str = (
     "https://github.com/CamoufoxCloud/geoip-all-in-one/releases/download/{tag}/{asset}"
 )
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Preloaded intermediate certificates (Mozilla's Remote Settings, collection security-state/intermediates)
+# ─────────────────────────────────────────────────────────────────────────
+# A retail Firefox keeps the intermediates of the public web preloaded in cert_storage, from this collection; the engine no longer syncs it, so the core
+# declares the list: it downloads it from the same service Firefox uses (from the USER's Python, never from the engine), verifies it, and hands the engine
+# a file (the pref INTERMEDIATES_PREF). The addresses are the ones the engine's own source reads: the server is the default of `services.settings.server`
+# (`toolkit/modules/AppConstants.sys.mjs`, REMOTE_SETTINGS_SERVER_URLS), the changes feed is `Utils.CHANGES_PATH` (`services/settings/Utils.sys.mjs`), the
+# changeset path is `RemoteSettingsClient._fetchChangeset`, and the bundle is `Downloader.cacheAll` (`services/settings/Attachments.sys.mjs`).
+REMOTE_SETTINGS_SERVER: str = "https://firefox.settings.services.mozilla.com/v2"
+INTERMEDIATES_BUCKET: str = "security-state"
+INTERMEDIATES_COLLECTION_ID: str = "intermediates"
+#: The collection's own timestamp, asked the light way: the entry of the changes feed (`monitor/changes`) filtered to this collection.
+INTERMEDIATES_LATEST_URL: str = (
+    REMOTE_SETTINGS_SERVER + "/buckets/monitor/collections/changes/changeset"
+    "?_expected=0&bucket=security-state&collection=intermediates"
+)
+#: The whole collection (`expected` = the timestamp the monitor gave, or 0 when it is not known: it only busts the cache in front of the server).
+INTERMEDIATES_CHANGESET_URL_TEMPLATE: str = (
+    REMOTE_SETTINGS_SERVER + "/buckets/security-state/collections/intermediates/changeset?_expected={expected}"
+)
+#: The server's root answers `capabilities.attachments.base_url`, where every attachment (and the bundle) lives.
+INTERMEDIATES_SERVER_INFO_URL: str = REMOTE_SETTINGS_SERVER + "/"
+#: Under that base: ONE zip with every attachment of the collection (`<record id>.meta.json` + `<record id>`).
+INTERMEDIATES_BUNDLE_PATH: str = "bundles/security-state--intermediates.zip"
+#: The file the engine reads, and the pref that names it (an absolute path).
+INTERMEDIATES_FILE_NAME: str = "intermediates.json"
+INTERMEDIATES_SOURCES_NAME: str = "SOURCES.json"
+INTERMEDIATES_PREF: str = "zoom.stealth.intermediates.file"

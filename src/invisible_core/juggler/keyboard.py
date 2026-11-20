@@ -277,15 +277,10 @@ def _build_closure(layout: str = "us") -> dict:
     return out
 
 
-_CLOSURES: dict = {}
-
-
 def closure_for(layout: str) -> dict:
-    """The closure of a layout (KLID or alias), built once."""
-    layout = LAYOUT_ALIASES.get(layout, layout)
-    if layout not in _CLOSURES:
-        _CLOSURES[layout] = _build_closure(layout)
-    return _CLOSURES[layout]
+    """The closure of a layout (KLID or alias), built on EVERY call: nothing is kept, so what a keyboard costs is
+    seen where it is built. (The one built at import is :data:`LAYOUT_CLOSURE`, a constant.)"""
+    return _build_closure(LAYOUT_ALIASES.get(layout, layout))
 
 
 #: The US keyboard's closure: what a session with no layout of its own types on.
