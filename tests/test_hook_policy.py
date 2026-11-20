@@ -1122,3 +1122,20 @@ def test_an_unknown_key_also_says_the_installed_core_may_be_older(tmp_path, caps
     assert "nothing reads" in err and "misspelt key" in err
     assert "installed invisible-core is older" in err
     assert "upgrade it" in err and "pin" in err
+
+
+def test_pytest_parallel_args_uses_xdist_worksteal_and_respects_serial_override(monkeypatch):
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "xdist" else None)
+    assert hooks._pytest_parallel_args(sys.executable, {}) == ["-n", "auto", "--dist", "worksteal"]
+    assert hooks._pytest_parallel_args(sys.executable, {"INVISIBLE_PYTEST_WORKERS": "8"}) == [
+        "-n",
+        "8",
+        "--dist",
+        "worksteal",
+    ]
+    assert hooks._pytest_parallel_args(sys.executable, {"INVISIBLE_PYTEST_WORKERS": "1"}) == []
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+    assert hooks._pytest_parallel_args(sys.executable, {}) == []

@@ -487,6 +487,45 @@ Runner = Callable[[Sequence[str], Path], int]
 #: by this hook's own message rather than by a traceback.
 _RUFF_PROBE = ("import importlib.util, sys; "
                "sys.exit(0 if importlib.util.find_spec('ruff') else 1)")
+_XDIST_PROBE = ("import importlib.util, sys; "
+                "sys.exit(0 if importlib.util.find_spec('xdist') else 1)")
+
+
+def _pytest_parallel_args(
+    py: str,
+    env: Dict[str, str],
+    *,
+    probe: bool = True,
+) -> List[str]:
+    """Return `pytest-xdist` parallel flags when `xdist` is available in `py`."""
+    import importlib.util
+
+    workers = (env.get("INVISIBLE_PYTEST_WORKERS") or "").strip()
+    if workers.lower() in {"0", "1", "off", "serial"}:
+        return []
+    has_xdist = False
+    try:
+        same_py = Path(py).resolve() == Path(sys.executable).resolve()
+    except OSError:
+        same_py = py == sys.executable
+    if same_py:
+        has_xdist = importlib.util.find_spec("xdist") is not None
+    elif probe:
+        try:
+            has_xdist = (
+                subprocess.run(
+                    [py, "-c", _XDIST_PROBE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode
+                == 0
+            )
+        except OSError:
+            has_xdist = False
+    if not has_xdist:
+        return []
+    return ["-n", workers or "auto", "--dist", "worksteal"]
 
 
 def main(
@@ -584,7 +623,15 @@ def main(
         # the real binary" while meaning "no browser" in the other two. Same
         # word, two contracts, and the copy carried the wrong one into a file
         # that now speaks for every repo that pins this package.
-        if run([py, "-m", "pytest", "-q", "--tb=short"], root):
+        pytest_cmd = [
+            py,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            *_pytest_parallel_args(py, env, probe=(run is _subprocess_run)),
+        ]
+        if run(pytest_cmd, root):
             _say("", err=True)
             _say("TESTS FAILED - push aborted.", err=True)
             _say("Fix the failure, or `git push --no-verify` if you really know "
