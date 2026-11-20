@@ -115,7 +115,7 @@ def _geoip_latest_url() -> str:
 
 
 def _latest_geoip_tag_api() -> str:
-    """Latest ``CamoufoxCloud/geoip-all-in-one`` release tag via the GitHub API
+    """Latest ``daijro/geoip-all-in-one`` release tag via the GitHub API
     (fallback for :func:`_resolve_latest_geoip_tag` when the permalink HEAD
     can't be parsed)."""
     headers = {"Accept": "application/vnd.github+json"}

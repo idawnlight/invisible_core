@@ -156,7 +156,7 @@ def test_download_failure_with_cache_falls_back(cache, monkeypatch):
 def test_resolve_tag_from_permalink_redirect(monkeypatch):
     class _Resp:
         headers = {"Location":
-                   "https://github.com/CamoufoxCloud/geoip-all-in-one/releases/download/"
+                   "https://github.com/daijro/geoip-all-in-one/releases/download/"
                    "2026.06.17/geoip-aio-all.mmdb.zip"}
 
     monkeypatch.setattr(dl.requests, "head", lambda *a, **k: _Resp())

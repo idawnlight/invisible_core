@@ -144,7 +144,7 @@ RELEASE_URL_TEMPLATE = release_url_template(os.environ.get(
 # ─────────────────────────────────────────────────────────────────────────
 #  GeoIP database (timezone="auto" → resolve IANA zone from proxy egress IP)
 # ─────────────────────────────────────────────────────────────────────────
-# CamoufoxCloud/geoip-all-in-one merges IP2Location LITE + GeoLite2 + DB-IP
+# daijro/geoip-all-in-one merges IP2Location LITE + GeoLite2 + DB-IP
 # into a single mmdb (country ISO + coordinates + IANA timezone via tzfpy),
 # rebuilt weekly. GPL-3.0, so we DOWNLOAD it at runtime into the user cache
 # (like the Firefox binary) rather than bundling it into this MIT package. The
@@ -152,11 +152,11 @@ RELEASE_URL_TEMPLATE = release_url_template(os.environ.get(
 # are pruned, so a pinned tag eventually 404s): on every check interval it
 # resolves the CURRENT latest tag from the `releases/latest/download` permalink
 # (no GitHub API, no rate limit) and pulls it if newer than the cache.
-GEOIP_REPO: str = "CamoufoxCloud/geoip-all-in-one"
+GEOIP_REPO: str = "daijro/geoip-all-in-one"
 GEOIP_ASSET: str = "geoip-aio-all.mmdb.zip"
 GEOIP_MMDB_NAME: str = "geoip-aio-all.mmdb"
 GEOIP_RELEASE_URL_TEMPLATE: str = (
-    "https://github.com/CamoufoxCloud/geoip-all-in-one/releases/download/{tag}/{asset}"
+    "https://github.com/daijro/geoip-all-in-one/releases/download/{tag}/{asset}"
 )
 
 # ─────────────────────────────────────────────────────────────────────────

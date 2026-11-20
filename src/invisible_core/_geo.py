@@ -3,7 +3,7 @@
 Approach B: discover the egress IP with one HTTP request - routed *through the
 proxy* when one is set, otherwise a direct request that sees the host's own
 public IP - then map IP → IANA timezone with an offline mmdb
-(``CamoufoxCloud/geoip-all-in-one``, downloaded + cached by ``_geoip_db.py``).
+(``daijro/geoip-all-in-one``, downloaded + cached by ``_geoip_db.py``).
 
 Precedence (see ``prepare_session_geo``):
 
