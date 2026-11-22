@@ -1,9 +1,9 @@
-"""The mechanics of a downloaded asset the core keeps in the machine's cache: GeoIP's database and Mozilla's intermediates list.
+"""The mechanics of a downloaded asset the core keeps in the machine's cache: GeoIP's database and the security state.
 
 SPLIT OUT OF `_geoip_db.py`. That file held, next to the GeoIP specifics (which release is the latest, what the archive holds), everything that is true of ANY
 asset fetched once and kept: a root in the state directory with one directory per version, the newest one wins, a `.last-check.json` that says when the source was
 last asked, a process that asks at most once, one process of the machine at a time on the download, a version that appears complete or not at all, and the old
-ones pruned. A second asset (`_intermediates.py`) needed the same, so it is here once; each user keeps only what is its own.
+ones pruned. A second asset (`_security_state.py`, which uses the lock, the flight, the staging directory and the rename, and keeps its own versions) needed the same, so it is here once; each user keeps only what is its own.
 
 Nothing here knows an asset's name, its source or its format. What differs is passed in as a callable or a value, and the users pass THEIR module's globals
 through small wrappers, so a test that patches a name of the user's module still reaches the code that reads it.

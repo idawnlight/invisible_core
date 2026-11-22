@@ -1,0 +1,80 @@
+name: noreply-identity
+
+# Every commit, annotated tag and tagger this event makes public must carry a
+# GitHub noreply address. Reusable: any repository of the organisation calls it
+# with `uses: oss-invisible/core/.github/workflows/noreply-identity.yml@main`.
+# Pull requests and pushes to main of THIS repository come through ci.yml (the
+# `gate` waits for it); here `push` covers the branches without a pull request
+# and the tags. No `pull_request` trigger and no cancelling concurrency:
+# tests/test_ci_runs_once_per_commit.py holds both.
+on:
+  workflow_call:
+  push:
+    branches-ignore: [main]
+    tags: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  noreply-identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The repository being judged (the caller's, in a called workflow), with
+      # all its history: the range of commits is computed against its refs.
+      # Commits and tags only (`tree:0`), and no file but .github in the working
+      # tree: the judge reads addresses, never contents. A full clone of the
+      # engine series (about 5 GB) did not finish in 5 minutes (run 44708578369);
+      # without trees it is about 300 MB.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+          sparse-checkout: /.github/
+          sparse-checkout-cone-mode: false
+      # The judge is read from main of the core, never from the judged branch.
+      - uses: actions/checkout@v4
+        with:
+          repository: idawnlight/invisible_core
+          ref: main
+          path: .noreply-judge
+          sparse-checkout: scripts/ci_noreply_identity.py
+          sparse-checkout-cone-mode: false
+      - name: every address is a GitHub noreply one
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          script=.noreply-judge/scripts/ci_noreply_identity.py
+          if [ ! -f "$script" ]; then
+            if [ "$REPO" = "oss-invisible/core" ] && [ -f scripts/ci_noreply_identity.py ]; then
+              # Only the pull request that adds the script runs before main has it.
+              echo "BOOTSTRAP: main del core non ha ancora lo script"
+              script=scripts/ci_noreply_identity.py
+            else
+              echo "the judge $script is missing from main of oss-invisible/core" >&2
+              exit 1
+            fi
+          fi
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              python3 "$script" --event pull_request --base "$BASE_SHA" --head "$HEAD_SHA" --base-ref "$BASE_REF"
+              ;;
+            push)
+              python3 "$script" --event push --ref "$REF" --before "$BEFORE" --after "$AFTER"
+              ;;
+            *)
+              python3 "$script" --event other --head "$SHA" --default-ref "$DEFAULT_BRANCH"
+              ;;
+          esac

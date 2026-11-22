@@ -14,12 +14,12 @@ concurrency:
 
 env:
   GITHUB_TOKEN: ${{ github.token }}
-  # The preloaded-intermediates list every job launches with: ci/intermediates.json, a fixed file of this repository (empty, format 1, the sha256 in
-  # ci/intermediates.pin.json). With the variable set the core neither downloads Mozilla's list nor checks it, so no job here asks Mozilla for anything -
-  # wrapper-on-this-core included, which tests the wrapper's MAIN and its workflows' own fixed file. user-install.yml is the user's path and has none.
-  STEALTHFOX_INTERMEDIATES: ${{ github.workspace }}/ci/intermediates.json
+  STEALTHFOX_SECURITY_STATE: ${{ github.workspace }}/ci/security-state
 
 jobs:
+  noreply-identity:
+    uses: ./.github/workflows/noreply-identity.yml
+
   release-support:
     runs-on: ubuntu-latest
     outputs:
@@ -47,6 +47,9 @@ jobs:
 
   tests:
     runs-on: ${{ matrix.os }}
+    env:
+      TEMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
+      TMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
     strategy:
       fail-fast: false
       matrix:
@@ -187,6 +190,9 @@ jobs:
     needs: release-support
     if: needs.release-support.outputs.backend == 'pypi'
     runs-on: ${{ matrix.os }}
+    env:
+      TEMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
+      TMP: ${{ startsWith(matrix.os, 'windows') && 'D:\a\_temp' || '/tmp' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -386,19 +392,21 @@ jobs:
           PY
 
   gate:
-    needs: [release-support, tests, msix-host, arm64-host, branding-is-retail, repair-through-the-installer,
+    needs: [noreply-identity, release-support, tests, msix-host, arm64-host, branding-is-retail, repair-through-the-installer,
             default-selection-stays-inside]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: refuse unless every matrix job succeeded
         run: |
+          echo "noreply-identity: ${{ needs.noreply-identity.result }}"
           echo "tests: ${{ needs.tests.result }}"
           echo "msix-host: ${{ needs.msix-host.result }}"
           echo "arm64-host: ${{ needs.arm64-host.result }}"
           echo "branding-is-retail: ${{ needs.branding-is-retail.result }}"
           echo "repair-through-the-installer: ${{ needs.repair-through-the-installer.result }}"
           echo "default-selection-stays-inside: ${{ needs.default-selection-stays-inside.result }}"
+          test "${{ needs.noreply-identity.result }}" = "success"
           test "${{ needs.tests.result }}" = "success"
           test "${{ needs.release-support.result }}" = "success"
           if [ "${{ needs.release-support.outputs.windows }}" = "true" ]; then

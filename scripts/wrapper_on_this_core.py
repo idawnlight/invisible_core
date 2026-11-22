@@ -94,10 +94,6 @@ _NEVER_COLLECTED = "playwright-upstream"
 EXCLUDED = (
     ("windows", "tests/test_juggler_posix_pipe.py",
      "the POSIX leg of the pipe does not execute on Windows (module-level skipif on win32)"),
-    (None, "tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py",
-     "every test of the file asks engine_at_least(\"firefox-65\") and the engine the seal names is older "
-     "(the engine gate skips); on Windows the refusal tests also skip by themselves (skipif on win32: "
-     "the system theme is declared, and its absence refused, on Linux only)"),
     ("windows", "tests/test_fission_strategy1_bench.py::test_same_site_other_port_stays_in_process",
      "it asks for the processes of a site by name, which only Linux has (tests/_processes.py: "
      "pytest.skip off Linux; Windows names no process, ProcessUtils_none.cpp)"),
@@ -146,10 +142,6 @@ def _excluded_for(system: str) -> list[str]:
 # WITNESS: a check, on the wrapper checkout, that its reason still holds. A witness
 # that does not hold is RED, naming the entry: run it, remove the exclusion.
 
-_ENGINE_TAG = re.compile(r"^firefox-(\d+)(?:-candidate)?$")
-_ENGINE_GATE = re.compile(r"engine_at_least\(\s*[\"']firefox-(\d+)[\"']\s*\)")
-
-
 def _read(wrapper: Path, rel: str) -> str:
     path = Path(wrapper) / rel
     if not path.is_file():
@@ -173,27 +165,6 @@ def _w_module_skipif_win32(rel: str):
         if not re.search(r"^pytestmark\s*=\s*pytest\.mark\.skipif\(\s*sys\.platform\s*==\s*[\"']win32[\"']",
                          _read(wrapper, rel), re.MULTILINE):
             raise _Gone(f"{rel} no longer skips the whole module on win32")
-    return check
-
-
-def _w_engine_gate(rel: str):
-    """Every test of the file asks for an engine newer than the one the seal names."""
-    def check(wrapper: Path, engine_tag: str | None) -> None:
-        m = _ENGINE_TAG.match(engine_tag or "")
-        if not m:
-            raise _Gone(f"the seal of the core under test has no engine number (tag {engine_tag!r}): "
-                        f"it is not known whether {rel} is still gated")
-        have = int(m.group(1))
-        blocks = re.split(r"^(?:async )?def test_", _read(wrapper, rel), flags=re.MULTILINE)[1:]
-        if not blocks:
-            raise _Gone(f"{rel} has no test any more")
-        for block in blocks:
-            gate = _ENGINE_GATE.search(block)
-            if not gate:
-                raise _Gone(f"a test of {rel} (test_{block.split('(', 1)[0]}) no longer asks engine_at_least")
-            if int(gate.group(1)) <= have:
-                raise _Gone(f"the engine the seal names ({engine_tag}) is firefox-{have}, and "
-                            f"{rel} asks only for firefox-{gate.group(1)}: its tests run now")
     return check
 
 
@@ -232,8 +203,6 @@ def _w_workbench(rel: str, test_name: str, skip_reason: str, absent: str, depth:
 #: entry (its target in EXCLUDED) -> the check of its reason.
 WITNESSES = {
     "tests/test_juggler_posix_pipe.py": _w_module_skipif_win32("tests/test_juggler_posix_pipe.py"),
-    "tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py":
-        _w_engine_gate("tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py"),
     "tests/test_fission_strategy1_bench.py::test_same_site_other_port_stays_in_process":
         _w_processes_by_site("test_same_site_other_port_stays_in_process"),
     "tests/test_fission_strategy1_bench.py::test_cross_site_iframe_gets_its_own_process":

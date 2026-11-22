@@ -1495,8 +1495,8 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     full_env = _engine_env.compose(os.environ if env is None else env, locale)
     spawn = _spawn_windows if sys.platform == "win32" else _spawn_posix
     to_browser, from_browser, p = spawn(executable, argv, full_env)
-    # The pref that names the intermediates list is NOT written here: `launch.write_user_js` writes it, before this function is called, from the cache. A launch
-    # starts no check of a newer list (that is `fetch`'s job: `_intermediates.update_intermediates`).
+    # The security state (intermediates, OneCRL, CRLite) is NOT placed here: `launch.write_user_js` copies it into the profile, before this function is called, from the
+    # cache, and writes no pref for it. A launch starts no check of a newer one (that is `fetch`'s job: `_security_state.update_security_state`).
     # ⛔ THE SESSION'S TOKEN MEANS THIS LAUNCH'S TREE from here on: `find_processes` and `reap` list and end it from the
     # tree (its job, its engine's descendants) instead of searching the machine for the processes that carry the token.
     tree = getattr(p, "tree", None)

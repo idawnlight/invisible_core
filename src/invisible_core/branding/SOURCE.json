@@ -1,5 +1,5 @@
 {
-  "mozilla_tag": "FIREFOX_160_0_RELEASE",
+  "mozilla_tag": "FIREFOX_160_0_1_RELEASE",
   "sets": {
     "official": {
       "about-logo-private.png": "7d4d3f1ab2f3e4bacd694c1f112050e78572a1c5322b78d42f5b16cee703ca03",

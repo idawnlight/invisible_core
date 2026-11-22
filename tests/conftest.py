@@ -155,17 +155,17 @@ def _no_geoip_download(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
-def _no_intermediates_download(monkeypatch, request):
-    """The launch declares Mozilla's intermediates list (`launch.write_user_js`), and a launch is made by many tests that think they are hermetic.
+def _no_security_state_download(monkeypatch, request):
+    """The launch places the security state in its profile (`launch.write_user_js`), and a launch is made by many tests that think they are hermetic.
 
-    A cold cache would download the list from Mozilla in line, so the function the launch calls is stubbed, as `ensure_geoip_mmdb` is above: no list, no
-    request. The tests of the list itself bring the real one back by name, and a test marked `e2e` (it needs the network, by that marker's own definition)
-    gets it untouched."""
+    A cold cache would download Mozilla's collections in line and run the engine's generate mode, so the function the launch calls is stubbed, as `ensure_geoip_mmdb`
+    is above: nothing ready, no request, no engine. The tests of the security state itself bring the real one back by name, and a test marked `e2e` (it needs the
+    network or the engine, by that marker's own definition) gets it untouched."""
     if request.node.get_closest_marker("e2e"):
         return
-    import invisible_core._intermediates as _im
+    import invisible_core._security_state as _ss
 
-    monkeypatch.setattr(_im, "ensure_intermediates", lambda *a, **kw: None)
+    monkeypatch.setattr(_ss, "ensure_security_state", lambda *a, **kw: None)
 
 
 class _ExitNotAskedInTests(ConnectionError):

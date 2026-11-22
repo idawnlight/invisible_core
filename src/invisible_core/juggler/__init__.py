@@ -31,7 +31,7 @@ re-exported below, which is the list `tests/test_consumer_contract.py` freezes.
 """
 from . import actions, connection, injected, keyboard, keylayout, lifecycle, protocol
 from ._behaviour import (
-    PageActs, PointerPersona, Step, initial_pointer, landing_point,
+    InputLatency, PageActs, PointerPersona, Step, initial_pointer, landing_point,
     plan_aimless_move, plan_approach, plan_idle, plan_scroll, popup_number,
     steps_from_waypoints, tail_within,
 )
@@ -47,7 +47,7 @@ from ._profile import (
 __all__ = [
     "actions", "connection", "injected", "keyboard", "keylayout", "lifecycle",
     "protocol",
-    "PageActs", "PointerPersona", "Step", "initial_pointer", "landing_point",
+    "InputLatency", "PageActs", "PointerPersona", "Step", "initial_pointer", "landing_point",
     "plan_aimless_move", "plan_approach", "plan_idle", "plan_scroll",
     "popup_number", "steps_from_waypoints", "tail_within",
     "CursorMotion",

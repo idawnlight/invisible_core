@@ -96,7 +96,7 @@ CONTRACT = {
         "configure_proxy", "ensure_binary",
         "parse_proxy",
         "ensure_geoip_mmdb",
-        "update_intermediates",
+        "update_security_state",
         "get_default_args", "get_default_stealth_prefs",
         "make_virtual_display", "network_to_declare", "prepare_session_geo",
         "resolve_session_timezone",

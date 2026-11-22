@@ -61,9 +61,16 @@ def _checkout(tmp_path):
     (pkg / "_version.py").write_text('__version__ = "0.99.0"\n', encoding="utf-8")
 
 
-def _run_the_wait(tmp_path, plan, *, seconds=3.0, poll=0.05, call_seconds=None, confirmations=None):
+# No test here depends on how fast a call answers. A call that answers (y, n) answers at once, whatever the load of the machine; a call that
+# hangs (h) sleeps for 5 minutes, far beyond any timeout the tests give it, so only the timeout of the step ends it. The timeout of a call
+# (CALL_SECONDS) is wide, so that no answer given at once can reach it even on a machine that runs the whole suite in parallel; the deadline
+# of the wait (seconds) is wide too wherever the test is not about the deadline itself.
+CALL_SECONDS = 10.0
+
+
+def _run_the_wait(tmp_path, plan, *, seconds=120.0, poll=0.05, call_seconds=None, confirmations=None):
     """Run the wait with a uv that answers call number i as plan[i] says (the last letter repeats): y = resolves it, n = no such version,
-    h = does not answer (sleeps 30 s). Returns (completed process, the calls uv got, with their stdin)."""
+    h = does not answer (sleeps 5 minutes, until the step kills it). Returns (completed process, the calls uv got, with their stdin)."""
     _checkout(tmp_path)
     log = tmp_path / "uv-calls.jsonl"
     shim = tmp_path / "uv_shim.py"
@@ -76,7 +83,7 @@ def _run_the_wait(tmp_path, plan, *, seconds=3.0, poll=0.05, call_seconds=None, 
         plan = %r
         what = plan[min(n, len(plan) - 1)]
         if what == "h":
-            time.sleep(30)
+            time.sleep(300)
         if what == "y":
             sys.exit(0)
         sys.stderr.write("  x No solution found when resolving dependencies: invisible-core==9.9.9 was not found in the package registry" + chr(10))
@@ -89,9 +96,9 @@ def _run_the_wait(tmp_path, plan, *, seconds=3.0, poll=0.05, call_seconds=None, 
     if confirmations is not None:
         env["INDEX_WAIT_CONFIRMATIONS"] = str(confirmations)
     try:
-        r = subprocess.run([sys.executable, "-c", _wait_script()], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+        r = subprocess.run([sys.executable, "-c", _wait_script()], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
-        pytest.fail("the wait did not end within 60 s with INDEX_WAIT_SECONDS=%s: it does not read its deadline" % seconds)
+        pytest.fail("the wait did not end within 180 s with INDEX_WAIT_SECONDS=%s: it does not read its deadline" % seconds)
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return r, calls
 
@@ -117,7 +124,8 @@ def test_a_no_between_the_yes_starts_the_count_again(tmp_path):
 
 
 def test_the_wait_ends_in_an_error_that_names_the_missing_version_when_the_index_never_has_it(tmp_path):
-    r, calls = _run_the_wait(tmp_path, "n", seconds=1.0)
+    # The deadline is what ends this wait, so a clock is unavoidable; it is wide enough for several calls (each answers at once) to fit in it.
+    r, calls = _run_the_wait(tmp_path, "n", seconds=4.0, poll=0.2)
     assert r.returncode == 1, "a forgotten publish must fail the job here: " + r.stdout + r.stderr
     assert "::error::the index does not have invisible-core 9.9.9 yet" in r.stdout
     assert "minutes" in r.stdout and "No solution found" in r.stdout and "0 of 3 confirmations" in r.stdout
@@ -125,18 +133,20 @@ def test_the_wait_ends_in_an_error_that_names_the_missing_version_when_the_index
 
 
 def test_a_version_that_arrives_too_late_for_the_deadline_is_an_error_not_a_pass(tmp_path):
-    r, calls = _run_the_wait(tmp_path, "yy" + "n", seconds=1.0)
+    r, calls = _run_the_wait(tmp_path, "yy" + "n", seconds=4.0, poll=0.2)
     assert r.returncode == 1, "two yes then no until the deadline is not three in a row: " + r.stdout + r.stderr
+    assert len(calls) >= 3, "the wait ended before the third answer: %d calls" % len(calls)
 
 
 def test_a_call_that_does_not_answer_is_a_no_and_does_not_stop_the_wait(tmp_path):
-    r, calls = _run_the_wait(tmp_path, "hyyy", seconds=20.0, call_seconds=0.5)
+    r, calls = _run_the_wait(tmp_path, "hyyy", call_seconds=CALL_SECONDS)
     assert r.returncode == 0, r.stdout + r.stderr
     assert len(calls) == 4, "the hung call counts as one no, then three yes: %d calls" % len(calls)
 
 
 def test_a_call_that_never_answers_ends_in_the_error_with_what_happened(tmp_path):
-    r, calls = _run_the_wait(tmp_path, "h", seconds=1.5, call_seconds=0.3)
+    # The deadline (1 s) is over when the first call, which hangs, is ended by its timeout: the wait ends after that one call, whatever the load.
+    r, calls = _run_the_wait(tmp_path, "h", seconds=1.0, call_seconds=CALL_SECONDS)
     assert r.returncode == 1 and "uv did not answer within" in r.stdout, r.stdout + r.stderr
 
 

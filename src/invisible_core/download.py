@@ -62,7 +62,7 @@ ENGINE_DIR_ENV = environment.ENGINE_DIR
 #: the cache root (the default) these must never be taken for engine trees.
 #: Until 47.41.0 only geoip/ was excluded, so `doctor` listed fonts/ as an
 #: unreadable engine and clear_cache(everything=True) removed it.
-STATE_DIRS = ("geoip", "fonts", "intermediates")
+STATE_DIRS = ("geoip", "fonts", "security-state")
 
 
 def cache_root() -> Path:

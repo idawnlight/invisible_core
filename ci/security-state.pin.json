@@ -1,0 +1,6 @@
+{
+  "comment": "The ready security state every job of ci.yml launches with (STEALTHFOX_SECURITY_STATE, set at the top of the workflow): a result with NO data (format 1, ok, no CRLite hashes, zero timestamps, no engine) and no security_state/ directory, so a launch copies nothing and no job asks Mozilla for anything or runs the engine's generate mode (the core neither downloads nor generates when the variable is set). To change it, change ci/security-state/securitystate-result.json and sha256 here in one commit; tests/test_ci_sets_the_security_state.py fails when they differ.",
+  "file": "ci/security-state/securitystate-result.json",
+  "sha256": "15bed64b8d0d0db9e6e5cceeec231bbca5300cdc6715280a647895dd6f6f14a4",
+  "bytes": 260
+}

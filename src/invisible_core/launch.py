@@ -6,14 +6,14 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import _engine_env
 from . import environment
 from ._headless import DESKTOP_ENV
-from .constants import INTERMEDIATES_PREF
 from ._webrtc_network import network_to_declare
 
 
@@ -45,7 +45,8 @@ def _pref_literal(name: str, v: Any) -> str:
                     "(a fraction is written as a string)" % (name, type(v).__name__))
 
 
-def write_user_js(profile_dir: "str | os.PathLike[str]", prefs: Dict[str, Any]) -> Path:
+def write_user_js(profile_dir: "str | os.PathLike[str]", prefs: Dict[str, Any], *, engine: "Optional[str | os.PathLike[str]]" = None,
+                  engine_argv: Optional[Sequence[str]] = None) -> Path:
     """Write ``prefs`` as ``user_pref(...)`` lines into ``<profile_dir>/user.js``.
 
     Creates ``profile_dir`` if missing; overwrites any existing ``user.js``.
@@ -72,21 +73,22 @@ def write_user_js(profile_dir: "str | os.PathLike[str]", prefs: Dict[str, Any]) 
     first real run. Bytes, not text: a text-mode write on Windows translates
     every newline, and a prefs file is read by the browser, not by git.
     """
-    # ⛔ THE PRELOADED INTERMEDIATES FILE IS DECLARED HERE, AND ONLY HERE: this is the one writer, so every launch of the core and of the wrapper passes
-    # through it exactly once, and the pref has one author. The cached file is a fact of the machine, not of the seed, so no composer of prefs knows it.
-    # A pref the caller already gave wins (and nothing is fetched); a cold cache downloads in line; with no list and no network there is NO line and the
-    # warning is said once (`_intermediates.ensure_intermediates`). A launch checks for no newer list: that is `fetch`'s job (`_intermediates.update_intermediates`).
-    if INTERMEDIATES_PREF not in prefs:
-        from ._intermediates import ensure_intermediates
-
-        listing = ensure_intermediates()
-        if listing is not None:
-            prefs = {**prefs, INTERMEDIATES_PREF: str(listing)}
     d = Path(profile_dir)
     d.mkdir(parents=True, exist_ok=True)
     out = d / "user.js"
     lines = [f"user_pref({json.dumps(k)}, {_pref_literal(k, v)});" for k, v in prefs.items()]
     out.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+    # ⛔ THE SECURITY STATE (the intermediates, OneCRL and the CRLite filters a retail Firefox has in `cert_storage` from its first second) IS PLACED HERE, AND ONLY
+    # HERE: this is the one writer, so every launch of the core and of the wrapper passes through it exactly once, and the directory has one author. It is COPIED
+    # into the profile (`<profile>/security_state/`, generated once by the engine and kept in the cache), never linked: the engine rewrites those files in place, and a
+    # link would write into the cache and into every other profile. NO PREF carries it: the engine finds the directory where cert_storage always looks. A warm cache
+    # is answered with no request and no thread, whatever its age (a newer state is looked for only by `fetch`, `_security_state.update_security_state`); a cold
+    # cache, or an engine the cache has no generation for, generates in line; with nothing to copy and no network there is NO directory, one warning is said once, and
+    # the browser starts like a retail one with a new profile (`_security_state.place_security_state`). `engine` is the binary this launch will run, when the caller
+    # chose it; `engine_argv` is its launch line without the profile (None: the invisible one, `[engine, -headless, -no-remote]`).
+    from ._security_state import place_security_state
+
+    place_security_state(d, engine=engine, engine_argv=engine_argv)
     return out
 
 
@@ -235,24 +237,33 @@ def cached_font_manifest_path(manifest: str) -> "Path | None":
     out = d / f"bundle-fonts-{digest}.list"
     if not out.is_file() or out.stat().st_size != len(raw):
         assert bytes([13, 10]) not in raw, "il manifest ha terminazioni CRLF"
-        # Write to a sibling and rename: two sessions starting together must
-        # never let one read the half-written file of the other.
-        tmp = out.with_suffix(f".{os.getpid()}.tmp")
+        # The file is addressed by the hash of its own bytes, so an existing one is the same file: it is never replaced
+        # and never read, because on Windows another session's browser holds it open. The temporary name is unique per
+        # process and per call; os.link creates `out` whole in one step or fails with FileExistsError.
+        tmp = out.with_name(f"{out.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_bytes(raw)
         try:
-            os.replace(tmp, out)
-        except PermissionError:
-            # Windows refuses to replace a file another process holds open without FILE_SHARE_DELETE, and a browser
-            # holds this one open: two sessions starting together on a fresh cache, the second one's rename came after
-            # the first one's browser opened the file (the Windows e2e of 13/11, 16 launches refused with WinError 5 in
-            # one job). The file is addressed by the hash of its own bytes, so the one there is the same; it is kept,
-            # and checked, rather than replaced. A file that is NOT the same is a real failure and still raises.
+            try:
+                os.link(tmp, out)
+            except FileExistsError:
+                pass
+            except OSError:
+                # No hard links on this file system: fall back to a rename, which Windows may refuse while a
+                # browser holds the existing file; that is accepted when the file there has the right size.
+                try:
+                    os.replace(tmp, out)
+                except PermissionError:
+                    pass
+            if out.stat().st_size != len(raw):
+                raise OSError(
+                    f"{out} exists with {out.stat().st_size} bytes, expected {len(raw)}: "
+                    "the font manifest cache file does not match its own hash"
+                )
+        finally:
             try:
                 tmp.unlink()
             except OSError:
                 pass
-            if not (out.is_file() and out.read_bytes() == raw):
-                raise
     return out
 
 
@@ -326,6 +337,9 @@ def build_launch_plan(
     # Where a SOCKS5 proxy's UDP exit is measured from (`"ip:port"` IPv4 literals; None = the two public defaults).
     # Python only: nothing of it reaches the browser. (This path takes no proxy; the keyword is validated all the same.)
     udp_stun_servers: Optional[List[str]] = None,
+    # The engine's launch line WITHOUT the profile (`[binary, ...]`; the core appends `-profile <work profile>`). Used only when the core must GENERATE the security state
+    # (a changed engine and no cached generation for it); None is invisible's own launch line, `[binary, -headless, -no-remote]`.
+    engine_argv: Optional[List[str]] = None,
 ) -> LaunchPlan:
     """The single direct-launch entry point (no Playwright, no Qt).
 
@@ -389,7 +403,7 @@ def build_launch_plan(
         show_cursor=show_cursor,
     ).prefs
     pdir = Path(profile_dir)
-    write_user_js(pdir, prefs)
+    write_user_js(pdir, prefs, engine=binary, engine_argv=engine_argv)
     env = build_launch_env(prefs, network_declared=network_to_declare(seed))
     argv = [binary, "-no-remote", "-profile", str(pdir)]
     argv += list(extra_args or [])

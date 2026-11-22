@@ -424,7 +424,14 @@ def foreign_identities(push_refs: str, repo: Path) -> List[Tuple[str, str, str]]
         if remote_sha and set(remote_sha) == {"0"}:
             commits = _commits_not_on_a_remote(local_sha, repo)
         else:
-            listed = _git_out(repo, "rev-list", f"{remote_sha}..{local_sha}")
+            # ⛔ NOT `remote..local` alone: a `git merge origin/main` inside a
+            # PR branch puts main's own commits in that range, and one of them
+            # (made in the web interface, 2026-11-20) refused a push whose own
+            # work was clean. A commit a remote already has is public; this
+            # gate is about what THIS push makes public. Same exclusion the
+            # new-ref case uses (`_commits_not_on_a_remote`), applied here too.
+            listed = _git_out(repo, "rev-list", f"{remote_sha}..{local_sha}",
+                              "--not", "--remotes")
             commits = (listed or "").split()
         for sha in commits:
             if sha in seen:

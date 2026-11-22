@@ -48,8 +48,9 @@ CORE_AUTOFIX_TIMEOUT = "INVISIBLE_CORE_AUTOFIX_TIMEOUT"
 UV = "UV"
 #: A local GeoIP database instead of the downloaded one (`_geoip_db`).
 GEOIP_MMDB = "STEALTHFOX_GEOIP_MMDB"
-#: A local intermediates list (`intermediates.json`) instead of the downloaded one (`_intermediates`).
-INTERMEDIATES = "STEALTHFOX_INTERMEDIATES"
+#: A ready security state (a directory holding `securitystate-result.json` and, when there is data, `security_state/`) instead of the generated one
+#: (`_security_state`): copied into every profile as it is, and `fetch` neither downloads nor generates.
+SECURITY_STATE = "STEALTHFOX_SECURITY_STATE"
 #: The font manifest the engine loads; a value already set wins (`launch`).
 FONT_MANIFEST = "STEALTHFOX_FONT_MANIFEST"
 #: The host network a session declares, `v4=<address>;v6=<0|1>`; a value already set wins (`launch`).
@@ -68,7 +69,7 @@ DESKTOP = "INVPW_DESKTOP"
 
 SETTINGS = (ENGINE_DIR, ENGINE_REPOSITORY, CACHE_DIR, DOWNLOAD_DEADLINE, GITHUB_TOKEN_OWN,
             GITHUB_TOKEN, SEAL_FILE, CORE_PIN, CORE_AUTOFIX,
-            CORE_AUTOFIX_TIMEOUT, UV, GEOIP_MMDB, INTERMEDIATES, FONT_MANIFEST,
+            CORE_AUTOFIX_TIMEOUT, UV, GEOIP_MMDB, SECURITY_STATE, FONT_MANIFEST,
             WEBRTC_NETWORK, CURSOR_TIMER)
 HANDOFFS = (CORE_AUTOFIX_ATTEMPTED, SESSION_TOKEN, DESKTOP)
 #: Everything the library reads from the environment.

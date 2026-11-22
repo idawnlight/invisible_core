@@ -1,9 +1,10 @@
-"""The list of preloaded intermediate certificates, declared by the core.
+"""The preloaded intermediate certificates, downloaded and verified by the core: one of the three inputs of the engine's generate mode.
 
-A retail Firefox has the intermediates of the public web in `cert_storage` from the first second: it takes them from Mozilla's Remote Settings collection
+A retail Firefox has the intermediates of the public web in `cert_storage` from its first second: it takes them from Mozilla's Remote Settings collection
 `security-state/intermediates`. The engine does not sync that collection any more (a sync reaches Mozilla's servers from the engine's own process, on a clock
-nobody declared), so the core DECLARES the list: this module downloads it from the same service Firefox uses, from the USER's Python, verifies it and keeps
-it in the cache as `intermediates.json`; the launch hands the engine its path (the pref `INTERMEDIATES_PREF`, written once, by `launch.write_user_js`, the one writer of `user.js`).
+nobody declared), so the core downloads it from the same service Firefox uses, from the USER's Python, and verifies it. This module only BUILDS the input; where
+it is kept, when it is renewed and how it reaches a profile is `_security_state.py`'s (the one road of the security state: the intermediates, OneCRL and the
+CRLite filters, handed together to the engine's generate mode, whose result every launch copies into its profile).
 
 THE FILE (read by the engine; its format is the engine's contract and is changed with it):
 
@@ -11,19 +12,12 @@ THE FILE (read by the engine; its format is the engine's contract and is changed
      "set_sha256":"<hex sha256 of the derHashes, sorted, joined by \\n>",
      "certs":[{"derHash":"<b64>","cert":"<b64 DER>","subject":"<b64 DER of the subject>"}]}
 
-compact, UTF-8, LF, the certs sorted by derHash; `SOURCES.json` beside it says where it came from. The version of a copy is the collection's own timestamp: one
-directory per version in the cache, the highest wins (`_cached_asset`).
-
-TWO ROADS, and only the second ever touches the network on a warm cache:
-  * `ensure_intermediates()` is what a launch calls BEFORE the browser starts. A copy in the cache is returned at once, with NO request, whatever its age:
-    a launch never waits for Mozilla and starts no thread for it. Only a cold cache downloads, in line (there is nothing else to declare).
-  * `update_intermediates()` is what `invisible-playwright fetch` calls, because the user asked for it: it asks the changes feed (a few hundred bytes)
-    for the collection's timestamp EVERY time and, when it is newer than the cache's, downloads, verifies and puts the new version in place. There is no
-    schedule and no state file: the user's command is the clock, and the answer of the feed is the only thing that decides.
+compact, UTF-8, LF, the certs sorted by derHash.
 
 NOTHING THAT DOES NOT ADD UP IS KEPT. Every record is checked against what the server itself says about it (the sha256 of the attachment, the hash of the
-DER, the subject) and the number of certificates against the number of records; one piece that fails refuses the whole download and the copy in the cache stays
-as it was. The checks use only the standard library (a minimal DER reader for the subject, below): a certificate library would be a dependency for one field.
+DER, the subject) and the number of certificates against the number of records; one piece that fails refuses the whole download (`IntermediatesError`) and the
+caller's cache stays as it was. The checks use only the standard library (a minimal DER reader for the subject, below): a certificate library would be a
+dependency for one field.
 """
 from __future__ import annotations
 
@@ -32,40 +26,26 @@ import binascii
 import hashlib
 import io
 import json
-import os
 import re
-import shutil
-import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
 
 import requests
 
-from . import _cached_asset as _asset
-from . import environment
 from .constants import (
     INTERMEDIATES_BUNDLE_PATH,
-    INTERMEDIATES_CHANGESET_URL_TEMPLATE,
+    INTERMEDIATES_COLLECTION_ID,
     INTERMEDIATES_FILE_NAME,
-    INTERMEDIATES_LATEST_URL,
     INTERMEDIATES_SERVER_INFO_URL,
-    INTERMEDIATES_SOURCES_NAME,
-    REMOTE_SETTINGS_SERVER,
+    SECURITY_STATE_CHANGESET_URL_TEMPLATE,
 )
-from .download import DOWNLOAD_ATTEMPTS, _with_retries, state_dir
+from .download import _with_retries
 
-__all__ = ["ensure_intermediates", "update_intermediates", "intermediates_path"]
+__all__ = ["IntermediatesError", "fetch_intermediates"]
 
 #: The collection's name as the file says it.
 _COLLECTION = "security-state/intermediates"
-
-#: The one cold download in flight in this process: the callers of a cold cache share it.
-_SLOT = _asset.FlightSlot()
-
-#: The warning about a cold cache with no network is printed once per process.
-_WARNED = False
 
 #: Bounds on what a server may hand back: the whole bundle, one attachment, one JSON answer. A certificate is about 2 KB and the bundle about 4 MB; the
 #: bounds only stop a wrong answer from filling memory.
@@ -77,39 +57,10 @@ class IntermediatesError(RuntimeError):
     """What was downloaded does not add up, or cannot be used. Never retried: asking again returns the same bytes."""
 
 
-# --- the cache -------------------------------------------------------------------------------------------------------------------------------------
-
-def _root() -> Path:
-    return state_dir("intermediates")
-
-
-def _version_of(path: Path) -> int:
-    name = path.parent.name
-    return int(name) if name.isdigit() else -1
-
-
-def _cached_file() -> Optional[Path]:
-    """The newest cached `intermediates.json` (the directory names are the collection's timestamps: numbers, so they are ordered as numbers), or None."""
-    return _asset.newest_file(_root(), "*/" + INTERMEDIATES_FILE_NAME, key=_version_of)
-
-
-def intermediates_path() -> Optional[Path]:
-    """The cached list, or None. Nothing is asked of the network."""
-    return _cached_file()
-
-
-def _warn_once(message: str) -> None:
-    global _WARNED
-    if _WARNED:
-        return
-    _WARNED = True
-    print("invisible_core: " + message, file=sys.stderr, flush=True)
-
-
 # --- the network (ONE seam) --------------------------------------------------------------------------------------------------------------------------
 
 def _get(url: str) -> bytes:
-    """The bytes of `url`. The only function of this module that reaches the network: a failure is a `requests` exception, so `_with_retries` reads its
+    """The bytes of `url`. The only function of this module (and of `_revocations`, which uses it) that reaches the network: a failure is a `requests` exception, so `_with_retries` reads its
     status the way it does for the other downloads."""
     with requests.get(url, timeout=(10, 60), stream=True) as r:
         r.raise_for_status()
@@ -300,139 +251,16 @@ def _compact(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
-def _sources_of(listing: dict, expected: int, base: str) -> dict:
-    return {
-        "server": REMOTE_SETTINGS_SERVER,
-        "urls": [
-            INTERMEDIATES_CHANGESET_URL_TEMPLATE.format(expected=expected),
-            INTERMEDIATES_SERVER_INFO_URL,
-            base + INTERMEDIATES_BUNDLE_PATH,
-        ],
-        "collection_timestamp": listing["collection_timestamp"],
-        "count": listing["count"],
-        "set_sha256": listing["set_sha256"],
-        "date": listing["fetched_utc"],
-    }
+def fetch_intermediates(directory: Path, expected: int, attempts: int) -> dict:
+    """Download the intermediates, verify them and write `directory/intermediates.json` (compact); returns the listing.
 
-
-def _write_files(directory: Path, listing_bytes: bytes, sources_bytes: bytes) -> None:
-    """The two files of a version, in a directory nobody else can see yet."""
-    (directory / INTERMEDIATES_FILE_NAME).write_bytes(listing_bytes)
-    (directory / INTERMEDIATES_SOURCES_NAME).write_bytes(sources_bytes)
-
-
-def _download_and_publish(attempts: int, expected: int) -> Path:
-    """Download, verify and put a new version in the cache; its path. Raises on anything that does not add up, with the cache as it was.
-
-    The version is built in a directory BESIDE the root and renamed into it in one step, so it is seen complete or not at all and a process that dies in the
-    middle leaves nothing in the root."""
-    changeset = _get_json(INTERMEDIATES_CHANGESET_URL_TEMPLATE.format(expected=expected), attempts)
+    `expected` is the collection's timestamp from the changes feed (or 0): it only busts the cache in front of the server. Three requests at most besides the
+    certificates the bundle lacks: the changeset, the server's info (where the attachments are) and the bundle. Anything that does not add up is
+    `IntermediatesError`; the caller works in a staging directory, so nothing is cleaned up here."""
+    url = SECURITY_STATE_CHANGESET_URL_TEMPLATE.format(collection=INTERMEDIATES_COLLECTION_ID, expected=expected)
+    changeset = _get_json(url, attempts)
     base = _attachments_base(attempts)
     bundle = _open_bundle(base, attempts)
     listing = build_list(changeset, base, bundle, attempts)
-    version = str(listing["collection_timestamp"])
-    root = _root()
-    staging = _asset.new_staging(root, ".tmp-intermediates-%s-" % version)
-    try:
-        _write_files(staging, _compact(listing),
-                     json.dumps(_sources_of(listing, expected, base), indent=2).encode("utf-8") + b"\n")
-        dst = root / version
-        _asset.put_in_place(staging, dst, lambda d: (d / INTERMEDIATES_FILE_NAME).is_file())
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    found = dst / INTERMEDIATES_FILE_NAME
-    if not found.is_file():
-        raise IntermediatesError("the intermediates list is not in %s after it was put in place" % dst)
-    newest = _cached_file()
-    _asset.prune_dirs(root, (newest or found).parent.name)
-    return found
-
-
-# --- the launch: the cold road, in line ----------------------------------------------------------------------------------------------------------------
-
-def _fetch_cold() -> Path:
-    """Nothing is cached: download in line, one process of the machine at a time, with the attempts a download has. Whoever gets the lock after another
-    process finished uses what that one left."""
-    def fetch_locked(_have):
-        return _download_and_publish(DOWNLOAD_ATTEMPTS, 0)
-
-    return _asset.check_and_fetch(
-        _asset.machine_lock(_root(), _asset.LOCK_WAIT_S),
-        cached=lambda: _cached_file(),
-        state_due=lambda: False,  # a copy is a copy: with one there is nothing to fetch
-        fetch_locked=fetch_locked,
-    )
-
-
-def ensure_intermediates(*, inline: bool = True) -> Optional[Path]:
-    """The intermediates file to declare, or None.
-
-    Resolution order:
-      1. ``STEALTHFOX_INTERMEDIATES`` -> that file (user-supplied / test); a missing one is an error.
-      2. A copy is cached -> it, with NO request, however old it is: a newer list is looked for only by `update_intermediates` (the `fetch` command).
-      3. Cold cache and `inline` -> download in line (the callers of one process share it), with the attempts of a download.
-      4. Cold cache and no network (or `inline=False`) -> None, with a warning on stderr once per process: the browser starts without the list, which is the
-         state it was in before the core declared one.
-    """
-    override = os.environ.get(environment.INTERMEDIATES)
-    if override:
-        p = Path(override)
-        if not p.is_file():
-            raise RuntimeError(f"{environment.INTERMEDIATES} points to a missing file: {p}")
-        return p
-    cached = _cached_file()
-    if cached is not None:
-        return cached
-    if not inline:
-        return None
-    try:
-        return _asset.ensure_once(
-            _SLOT,
-            cached=lambda: _cached_file(),
-            check_due=lambda: True,
-            mark_checked=lambda: None,
-            fetch=lambda: _fetch_cold(),
-        )
-    except Exception as exc:
-        _warn_once("the list of preloaded intermediate certificates could not be downloaded (%s); the browser starts without it. "
-                   "Connect once to download it, or set %s to a local intermediates.json." % (exc, environment.INTERMEDIATES))
-        return None
-
-
-# --- the user's `fetch`: is there a newer list? ------------------------------------------------------------------------------------------------------------
-
-def _latest_timestamp(attempts: int) -> int:
-    """The collection's timestamp, from the changes feed (a few hundred bytes), not from the collection."""
-    feed = _get_json(INTERMEDIATES_LATEST_URL, attempts)
-    for entry in feed.get("changes", []) if isinstance(feed, dict) else []:
-        if entry.get("bucket") == "security-state" and entry.get("collection") == "intermediates":
-            stamp = entry.get("last_modified")
-            if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
-                return stamp
-    raise IntermediatesError("the changes feed does not list the collection")
-
-
-def update_intermediates() -> Tuple[Optional[Path], bool]:
-    """Ask whether the collection has a newer list than the cache's and, if so, download, verify and put it in place. `(path, changed)`: the list to declare
-    (None when there is none) and whether this call put a new version in the cache.
-
-    Called by `invisible-playwright fetch`, so it asks EVERY time (a few hundred bytes from the changes feed) and downloads only when the feed's timestamp is
-    greater than the cached version (or the cache is empty). One process of the machine at a time; whoever gets the lock after another finished re-reads what
-    that one left. ``STEALTHFOX_INTERMEDIATES`` set -> nothing is asked or downloaded: `(that path, False)`. No network, or anything that does not add up ->
-    the cache is as it was, one warning on stderr, and no exception."""
-    override = os.environ.get(environment.INTERMEDIATES)
-    if override:
-        return Path(override), False
-    try:
-        with _asset.machine_lock(_root(), _asset.LOCK_WAIT_S):
-            have = _cached_file()
-            latest = _latest_timestamp(DOWNLOAD_ATTEMPTS)
-            if have is not None and latest <= _version_of(have):
-                return have, False
-            return _download_and_publish(DOWNLOAD_ATTEMPTS, latest), True
-    except Exception as exc:
-        kept = _cached_file()
-        print("invisible_core: could not look for a newer list of preloaded intermediate certificates (%s); %s" % (
-            exc, "the one in the cache stays" if kept is not None else "there is none in the cache, and the browser starts without it"),
-            file=sys.stderr, flush=True)
-        return kept, False
+    (Path(directory) / INTERMEDIATES_FILE_NAME).write_bytes(_compact(listing))
+    return listing

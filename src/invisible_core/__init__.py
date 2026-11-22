@@ -34,7 +34,9 @@ from .prefs import (
 )
 from .download import ensure_binary
 from ._geoip_db import ensure_geoip_mmdb
-from ._intermediates import ensure_intermediates, update_intermediates
+from ._security_state import ensure_security_state, update_security_state
+# Compatibility name ONLY: the wrapper's current CLI imports `update_intermediates`. It goes when the wrapper calls `update_security_state`.
+update_intermediates = update_security_state
 from ._geo import (
     GeoTimezoneError,
     SessionGeo,
@@ -82,6 +84,17 @@ except PackageNotFoundError:
     # Running from a source checkout with no install record at all.
     __install_record_version__ = ""
 
+# `InputLatency` is public but loaded on first use (PEP 562). Its module sits in
+# the Juggler client, and importing that package pulls in asyncio and the whole
+# client (55 modules); `import invisible_core` stays as light as it was.
+# `invisible_core.InputLatency` is the very object `juggler._behaviour` defines.
+def __getattr__(name):
+    if name == "InputLatency":
+        from .juggler import InputLatency
+        return InputLatency
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "record_session_seed",
     "resolve_session_seed",
@@ -109,8 +122,10 @@ __all__ = [
     # binary + geoip
     "ensure_binary",
     "ensure_geoip_mmdb",
-    # the preloaded intermediate certificates the core declares to the engine
-    "ensure_intermediates",
+    # the security state (intermediates, OneCRL, CRLite) the core has the engine generate and every launch copies into its profile
+    "ensure_security_state",
+    "update_security_state",
+    # the name the wrapper's `fetch` imports today: it goes when the wrapper calls `update_security_state`
     "update_intermediates",
     # geo / timezone / language: ONE decision, read by every consumer
     "prepare_session_geo",
@@ -140,6 +155,8 @@ __all__ = [
     "active_seal",
     "verify_engine",
     "write_user_js",
+    # the delay between an input event's birth and its arrival at a page's handler, drawn from the session seed
+    "InputLatency",
     # constants
     "BINARY_VERSION",
     "FIREFOX_UPSTREAM_VERSION",

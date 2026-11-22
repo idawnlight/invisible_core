@@ -32,8 +32,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent / "src" / "invisible_core"
 EXCEPTIONS: Dict[str, str] = {
     "_geoip_db:_CHECKED_THIS_PROCESS": "a flag that the database update was looked for once in this process; it answers no call",
     "_geoip_db:_SLOT": "the flight of a download in progress, shared by the callers that ask at the same moment",
-    "_intermediates:_WARNED": "the warning is printed once; the list it is about is read from the file on every call",
-    "_intermediates:_SLOT": "the flight of a download in progress, shared by the callers that ask at the same moment",
+    "_security_state:_WARNED": "the warning is printed once; the state it is about is read from the cache directory on every call",
+    "_security_state:_AGE_WARNED": "the ten-day warning is printed once; the age is read from the manifest on every call",
+    "_security_state:_SLOT": "the flight of a generation in progress, shared by the callers that ask at the same moment",
     "_cached_asset:FlightSlot": "the class of those flights: a download in progress, empty once it ends",
     "_geo:_egress_flight": "the request in flight, shared by callers that ask at the same moment; empty once it ends",
     "_geo:_egress_lock": "the lock of the flight above",

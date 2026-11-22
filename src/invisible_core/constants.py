@@ -163,27 +163,52 @@ GEOIP_RELEASE_URL_TEMPLATE: str = (
 #  Preloaded intermediate certificates (Mozilla's Remote Settings, collection security-state/intermediates)
 # ─────────────────────────────────────────────────────────────────────────
 # A retail Firefox keeps the intermediates of the public web preloaded in cert_storage, from this collection; the engine no longer syncs it, so the core
-# declares the list: it downloads it from the same service Firefox uses (from the USER's Python, never from the engine), verifies it, and hands the engine
-# a file (the pref INTERMEDIATES_PREF). The addresses are the ones the engine's own source reads: the server is the default of `services.settings.server`
-# (`toolkit/modules/AppConstants.sys.mjs`, REMOTE_SETTINGS_SERVER_URLS), the changes feed is `Utils.CHANGES_PATH` (`services/settings/Utils.sys.mjs`), the
-# changeset path is `RemoteSettingsClient._fetchChangeset`, and the bundle is `Downloader.cacheAll` (`services/settings/Attachments.sys.mjs`).
+# downloads it from the same service Firefox uses (from the USER's Python, never from the engine), verifies it, and hands it to the engine's generate mode
+# as a file (the pref INTERMEDIATES_PREF, written only on the work profile of a generation). The addresses are the ones the engine's own source reads: the
+# server is the default of `services.settings.server` (`toolkit/modules/AppConstants.sys.mjs`, REMOTE_SETTINGS_SERVER_URLS), the changes feed is
+# `Utils.CHANGES_PATH` (`services/settings/Utils.sys.mjs`), the changeset path is `RemoteSettingsClient._fetchChangeset`, and the bundle is
+# `Downloader.cacheAll` (`services/settings/Attachments.sys.mjs`).
 REMOTE_SETTINGS_SERVER: str = "https://firefox.settings.services.mozilla.com/v2"
-INTERMEDIATES_BUCKET: str = "security-state"
 INTERMEDIATES_COLLECTION_ID: str = "intermediates"
-#: The collection's own timestamp, asked the light way: the entry of the changes feed (`monitor/changes`) filtered to this collection.
-INTERMEDIATES_LATEST_URL: str = (
-    REMOTE_SETTINGS_SERVER + "/buckets/monitor/collections/changes/changeset"
-    "?_expected=0&bucket=security-state&collection=intermediates"
-)
-#: The whole collection (`expected` = the timestamp the monitor gave, or 0 when it is not known: it only busts the cache in front of the server).
-INTERMEDIATES_CHANGESET_URL_TEMPLATE: str = (
-    REMOTE_SETTINGS_SERVER + "/buckets/security-state/collections/intermediates/changeset?_expected={expected}"
-)
 #: The server's root answers `capabilities.attachments.base_url`, where every attachment (and the bundle) lives.
 INTERMEDIATES_SERVER_INFO_URL: str = REMOTE_SETTINGS_SERVER + "/"
 #: Under that base: ONE zip with every attachment of the collection (`<record id>.meta.json` + `<record id>`).
 INTERMEDIATES_BUNDLE_PATH: str = "bundles/security-state--intermediates.zip"
 #: The file the engine reads, and the pref that names it (an absolute path).
 INTERMEDIATES_FILE_NAME: str = "intermediates.json"
-INTERMEDIATES_SOURCES_NAME: str = "SOURCES.json"
 INTERMEDIATES_PREF: str = "zoom.stealth.intermediates.file"
+
+# ─────────────────────────────────────────────────────────────────────────
+#  The security state of a retail profile, as ready files (intermediates, OneCRL, CRLite)
+# ─────────────────────────────────────────────────────────────────────────
+# A retail Firefox 159 keeps three collections of the bucket `security-state` in cert_storage (`security/manager/ssl/RemoteSecuritySettings.sys.mjs`):
+# `intermediates` (above), `onecrl` (revocations of intermediates and roots, records without attachments, every record passed to `setRevocations` with
+# STATE_ENFORCE) and `cert-revocations` (the CRLite filters: of the records whose `filter_expression` holds for the channel `security.pki.crlite_channel`,
+# exactly one full filter, `incremental: false`, and the deltas, each attachment checked for sha256 and size). The core downloads them from the same service,
+# hands them ONCE to the engine in its generate mode (the four prefs below, on an empty work profile), and keeps what the engine wrote
+# (`<profile>/security_state/` and `securitystate-result.json`); a launch copies that directory into its profile and sets no pref of the security state.
+SECURITY_STATE_BUCKET: str = "security-state"
+#: The timestamps of every collection of the bucket, in one answer of the changes feed (a few hundred bytes).
+SECURITY_STATE_LATEST_URL: str = (
+    REMOTE_SETTINGS_SERVER + "/buckets/monitor/collections/changes/changeset?_expected=0&bucket=security-state"
+)
+#: One collection of the bucket (`expected` = its timestamp from the feed, or 0).
+SECURITY_STATE_CHANGESET_URL_TEMPLATE: str = (
+    REMOTE_SETTINGS_SERVER + "/buckets/security-state/collections/{collection}/changeset?_expected={expected}"
+)
+ONECRL_COLLECTION_ID: str = "onecrl"
+CRLITE_COLLECTION_ID: str = "cert-revocations"
+#: The default of `security.pki.crlite_channel` on desktop (`modules/libpref/init/StaticPrefList.yaml`); the core sets no other.
+CRLITE_CHANNEL: str = "default"
+#: cert_storage treats the filters as absent ten days after the last `setFullCRLiteFilter`/`addCRLiteDelta` (`cert_storage/src/lib.rs`, `is_crlite_fresh` on `last_crlite_update`).
+CRLITE_MAX_AGE_S: int = 10 * 24 * 3600
+#: The files the engine reads in its generate mode (formats in `_revocations.py` and `_intermediates.py`).
+ONECRL_FILE_NAME: str = "onecrl.json"
+CRLITE_FILE_NAME: str = "crlite.json"
+#: The generate mode: the switch and the three inputs (absolute paths). Written only on the work profile of a generation, never on a launch.
+SECURITY_STATE_GENERATE_PREF: str = "zoom.stealth.securitystate.generate"
+ONECRL_PREF: str = "zoom.stealth.onecrl.file"
+CRLITE_PREF: str = "zoom.stealth.crlite.file"
+#: What the generate mode leaves in the work profile: cert_storage's directory (copied as is into every profile) and the engine's report.
+SECURITY_STATE_DIR_NAME: str = "security_state"
+SECURITY_STATE_RESULT_NAME: str = "securitystate-result.json"

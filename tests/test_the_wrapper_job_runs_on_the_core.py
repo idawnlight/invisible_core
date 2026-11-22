@@ -473,21 +473,19 @@ def test_an_unknown_file_and_an_unknown_node_are_handled():
 
 def test_what_cannot_run_on_a_system_is_left_out_by_name_with_its_reason():
     mod = _load_script()
-    theme = "tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py"
     fission = "tests/test_fission_strategy1_bench.py"
     posix = "tests/test_juggler_posix_pipe.py"
-    for system in ("linux", "windows"):
-        assert theme in mod.excluded_nodes(system)[0]
     assert posix in mod.excluded_nodes("windows")[0] and posix not in mod.excluded_nodes("linux")[0]
     assert fission + "::test_same_site_other_port_stays_in_process" in mod.excluded_nodes("windows")[1]
     assert not any(n.startswith(fission) for n in mod.excluded_nodes("linux")[1])
     assert all(reason.strip() for _, _, reason in mod.EXCLUDED)
     # a whole-file exclusion keeps the file out of the plan; a node exclusion keeps the node out of its chunk
+    posix_file = {"parallel": 1.0, "serial": 0.0}
     table = {fission: {"parallel": 200.0, "serial": 0.0, "nodes": {"test_x": 100.0, "test_y": 100.0}},
-             theme: {"parallel": 1.0, "serial": 0.0}}
+             posix: posix_file}
     nodes = [fission + "::test_x", fission + "::test_y", fission + "::test_same_site_other_port_stays_in_process"]
-    plan = mod.plan_parts([fission, theme, "tests/test_other.py"], "windows", 2, lambda f: nodes, table)
-    assert theme not in [f for p in plan for f in p["files"]]
+    plan = mod.plan_parts([fission, posix, "tests/test_other.py"], "windows", 2, lambda f: nodes, table)
+    assert posix not in [f for p in plan for f in p["files"]]
     assert sorted(n for p in plan for n in p["nodes"]) == nodes[:2]
 
 
@@ -601,12 +599,6 @@ TODAY = {
     "tests/test_juggler_posix_pipe.py": (
         "import sys\nimport pytest\n\npytestmark = pytest.mark.skipif(\n    sys.platform == \"win32\",\n"
         "    reason=\"the POSIX leg does not execute on Windows\")\n\ndef test_the_posix_pipe_carries_messages_both_ways():\n    pass\n"),
-    "tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py": (
-        "import pytest\n\n" "@pytest.mark.e2e\n" "@pytest.mark.skipif(ON_WINDOWS, reason=\"x\")\n"
-        "def test_a_missing_pref_refuses_the_launch(firefox_binary, engine_at_least, pref):\n"
-        "    engine_at_least(\"firefox-65\")\n    pass\n\n" "@pytest.mark.e2e\n"
-        "def test_every_pref_declared_the_launch_succeeds(firefox_binary, engine_at_least):\n"
-        "    engine_at_least(\"firefox-65\")\n    pass\n"),
     "tests/_processes.py": (
         "import sys\nimport pytest\n\ndef site_processes_below(root_pid, site, engine_dir=None):\n"
         "    import psutil\n\n    if not sys.platform.startswith(\"linux\"):\n"
@@ -637,8 +629,6 @@ TODAY = {
 # The same text with the reason taken out of it: what each witness must notice.
 REASON_REMOVED = {
     "tests/test_juggler_posix_pipe.py": lambda t: t.replace("sys.platform == \"win32\"", "False"),
-    "tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py":
-        lambda t: t.replace("engine_at_least(\"firefox-65\")", "engine_at_least(\"firefox-60\")", 1),
     "tests/_processes.py": lambda t: t.replace("if not sys.platform.startswith(\"linux\"):", "if False:"),
     "tests/test_fission_strategy1_bench.py": lambda t: t.replace("return site_processes_below(", "return set(("),
     "tests/test_the_working_clone_has_the_workbench_next_to_it.py": lambda t: t.replace("pytest.skip(", "print("),
@@ -679,16 +669,6 @@ def test_each_witness_is_red_on_a_text_with_its_reason_removed_and_names_the_ent
             mine = [f for f in found if f.startswith(target + ":")]
             assert len(mine) == 1, (target, system, found)
             assert "the reason is gone: run it, remove the exclusion" in mine[0]
-
-
-def test_the_engine_witness_is_red_once_the_seal_names_the_engine_the_file_waits_for(tmp_path):
-    mod = _load_script()
-    theme = "tests/test_a_missing_system_theme_pref_refuses_the_launch_e2e.py"
-    root = _wrapper_tree(tmp_path)
-    for tag, red in (("firefox-64", False), ("firefox-64-candidate", False), ("firefox-65-candidate", True),
-                     ("firefox-66", True), ("local", True), (None, True)):
-        found = [f for f in mod.witness_problems(root, "linux", tag) if f.startswith(theme)]
-        assert bool(found) is red, (tag, found)
 
 
 def test_the_workbench_witness_is_red_where_the_workbench_files_are_present(tmp_path):

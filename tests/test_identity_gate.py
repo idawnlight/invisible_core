@@ -142,3 +142,38 @@ def test_skipping_says_so_and_identity_false_disables(repo, capsys):
 def test_no_refs_on_stdin_is_stated_not_passed_silently(repo, capsys):
     assert run(repo, "") == 0
     assert "identities were not checked" in capsys.readouterr().out
+
+
+def _remote_with_main_and_pr_branch(repo, tmp_path):
+    """main (private-email commit, already pushed) + a PR branch already pushed."""
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True,
+                   env=_clean_env())
+    git(repo, "remote", "add", "origin", str(bare))
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "-b", "pr")
+    pr_old = commit(repo, "pr1.txt")
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "web.txt", author=PRIVATE, committer=PRIVATE)
+    git(repo, "push", "-q", "origin", "main", "pr")
+    return base, pr_old
+
+
+def test_a_merge_of_main_into_a_pushed_branch_does_not_report_main_commits(
+        repo, tmp_path):
+    _base, pr_old = _remote_with_main_and_pr_branch(repo, tmp_path)
+    git(repo, "checkout", "-q", "pr")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge main", "main")
+    tip = commit(repo, "pr2.txt")
+    refs = f"refs/heads/pr {tip} refs/heads/pr {pr_old}\n"
+    assert hooks.foreign_identities(refs, repo) == []
+
+
+def test_a_new_private_commit_in_that_branch_is_still_reported(repo, tmp_path):
+    _base, pr_old = _remote_with_main_and_pr_branch(repo, tmp_path)
+    git(repo, "checkout", "-q", "pr")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge main", "main")
+    bad = commit(repo, "pr2.txt", author=PRIVATE)
+    refs = f"refs/heads/pr {bad} refs/heads/pr {pr_old}\n"
+    found = hooks.foreign_identities(refs, repo)
+    assert [(s, r) for s, r, _m in found] == [(bad, "author")]

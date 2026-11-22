@@ -138,7 +138,10 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
            proxy: Optional[Dict[str, str]] = None,
            ready_timeout: Optional[float] = 60.0,
            udp_stun_servers: Optional[List[str]] = None,
-           udp_exit: Optional[str] = None) -> "Browser":
+           udp_exit: Optional[str] = None,
+           # The engine's launch line WITHOUT the profile; used only when the core must GENERATE the security state (a changed engine, no cached generation for it).
+           # None is invisible's own launch line, `[executable, -headless, -no-remote]`.
+           engine_argv: Optional[List[str]] = None) -> "Browser":
     """Start the patched Firefox and hand back a `Browser` ready to open pages.
 
     `udp_stun_servers` (`"ip:port"` IPv4 literals; None = the two public defaults) is where a SOCKS5 proxy's UDP exit
@@ -180,7 +183,7 @@ def launch(executable: str, *, prefs: Optional[Dict] = None,
         from .keyboard import KEYBOARD_LAYOUT_PREF, profiles_pref
         layout = browser_prefs.pop(KEYBOARD_LAYOUT_PREF, None) or profiles_pref(
             browser_prefs.get("intl.accept_languages") or "")
-        write_user_js(files.profile, browser_prefs)
+        write_user_js(files.profile, browser_prefs, engine=executable, engine_argv=engine_argv)
         # ⛔ PARSED BEFORE THE BROWSER STARTS, so a proxy we cannot express
         # refuses the launch instead of leaving a process running without one.
         proxy_command = None
