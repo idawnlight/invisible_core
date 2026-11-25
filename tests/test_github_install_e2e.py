@@ -149,9 +149,19 @@ print(json.dumps({"path": str(entry), "tag": seal.tag,
     assert path.is_file() and path.is_relative_to(cache), path
     seal = installed["metadata"]["seal"]
     assert result["tag"] == seal["tag"] and result["source_commit"] == seal["source_commit"]
-    expected_prefix = ("https://github.com/idawnlight/firefox_antidetect_patch/"
-                       f"releases/download/{seal['tag']}/")
-    assert any(url.startswith(expected_prefix) for url in result["requested_urls"]), result
+    urls = result["requested_urls"]
+    direct_prefix = ("https://github.com/idawnlight/firefox_antidetect_patch/"
+                     f"releases/download/{seal['tag']}/")
+    api_tag_url = ("https://api.github.com/repos/idawnlight/firefox_antidetect_patch/"
+                   f"releases/tags/{seal['tag']}")
+    api_asset_prefix = ("https://api.github.com/repos/idawnlight/firefox_antidetect_patch/"
+                        "releases/assets/")
+    used_direct = any(url.startswith(direct_prefix) for url in urls)
+    used_api = (api_tag_url in urls
+                and any(url.startswith(api_asset_prefix) for url in urls))
+    assert used_direct or used_api, (
+        f"expected download from {direct_prefix!r} or ({api_tag_url!r} + {api_asset_prefix!r}), "
+        f"got requested_urls={urls!r}")
     for filename, identity in result["identity"].items():
         assert identity["sourcestamp"] == seal["source_commit"], (filename, identity)
         assert identity["buildid"] == result["build_id"], (filename, identity)
