@@ -653,10 +653,26 @@ def test_an_engine_that_has_been_reaped_does_not_name_a_process_that_reuses_its_
     assert tree.members() == []
 
 
+#: A process that says its pid and stays until its stdin closes (nothing in it counts a time). Where the interpreter is a venv's
+#: launcher (Windows) the process the test creates is the launcher and the one that says its pid is its child: the tree of a launch
+#: is what its processes said, never "the one process created" and never how many exist at an instant.
+_HOLD = "import os, sys; print(os.getpid(), flush=True); sys.stdin.read()"
+
+#: A process that starts a child of its own, waits until the child has said its pid, says both and stays: the tree it makes is
+#: more than the process the test created, and it is whole before the test is told anything.
+_HOLD_WITH_CHILD = ("import os, subprocess, sys; "
+                    "k = subprocess.Popen([sys.executable, '-c', %r], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True); "
+                    "print(os.getpid(), k.pid, k.stdout.readline().strip(), flush=True); sys.stdin.read()" % _HOLD)
+
+
 @pytest.mark.unit
 @pytest.mark.skipif(not WINDOWS, reason="the job object is Windows")
-def test_a_job_lists_and_ends_its_own_tree_and_only_it():
-    """`EngineJob.pids` lists what is in the job by its own account (the job of another launch holds its own), `terminate` ends all of it."""
+@pytest.mark.parametrize("program", [_HOLD, _HOLD_WITH_CHILD], ids=["alone", "with_a_child"])
+def test_a_job_lists_and_ends_its_own_tree_and_only_it(program):
+    """`EngineJob.pids` lists what is in the job by its own account (the job of another launch holds its own), `terminate` ends all of it.
+    The tree of each job is the set of processes that said their pids (each says it only once it runs, and a process that makes a
+    child says it only once the child does): nothing waits for a number of milliseconds or reads a count at an instant. A time
+    is only the net that lets a hanging test give up (`NET`)."""
     import ctypes
     from ctypes import wintypes
 
@@ -664,20 +680,25 @@ def test_a_job_lists_and_ends_its_own_tree_and_only_it():
     k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     k.AssignProcessToJobObject.restype = wintypes.BOOL
     a, b = P.EngineJob.create(), P.EngineJob.create()
-    procs = []
+    procs, ours = [], []
     try:
         for job in (a, b):
-            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], creationflags=0x4)
+            proc = subprocess.Popen([sys.executable, "-c", program], creationflags=0x4, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, text=True)
             procs.append(proc)
             assert k.AssignProcessToJobObject(job.handle, int(proc._handle))
             import psutil
             psutil.Process(proc.pid).resume()
-        assert a.pids() == [procs[0].pid] and b.pids() == [procs[1].pid]
+            said = proc.stdout.readline()             # it runs, and its tree is whole
+            assert said, "the process of the job said nothing: it ended (exit code %r)" % proc.poll()
+            ours.append({proc.pid, *(int(n) for n in said.split())})
+        assert set(a.pids()) == ours[0] and set(b.pids()) == ours[1]
+        assert not ours[0] & ours[1]
         a.terminate()
-        assert a.wait_empty(time.monotonic() + 10) is True
-        assert procs[0].wait(timeout=10) is not None
+        assert a.wait_empty(time.monotonic() + NET) is True
+        assert procs[0].wait(timeout=NET) is not None
         assert procs[1].poll() is None, "ending one job ended the other's process"
-        assert b.pids() == [procs[1].pid]
+        assert set(b.pids()) == ours[1]
     finally:
         for job in (a, b):
             job.close()
@@ -685,6 +706,8 @@ def test_a_job_lists_and_ends_its_own_tree_and_only_it():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+            proc.stdin.close()
+            proc.stdout.close()
 
 
 @pytest.mark.skipif(WINDOWS, reason="process groups are POSIX")

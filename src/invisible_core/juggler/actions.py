@@ -701,6 +701,15 @@ class Actions:
         / checked; presence in the DOM is answered by the selector resolving at
         all, so those two are handled here rather than asked of a function that
         would reject them.
+
+        ⛔ A SELECTOR THAT MATCHES NOTHING IS ALREADY `hidden` (and `detached`),
+        and `hidden` NEVER HANDS BACK A HANDLE. Stock Playwright's
+        `Frame.waitForSelector` returns null in the first turn when the
+        selector resolves to no element and the state is `hidden` or
+        `detached`; and for `hidden` on a present element that is not visible
+        it returns null too, the element it waited for being the one that went
+        away. Polling "the selector matches nothing" until the timeout made a
+        wait for a spinner that was already gone stall for its whole timeout.
         """
         frame = frame_id or self.lifecycle.main_frame
         if frame is None:
@@ -714,11 +723,16 @@ class Actions:
                     return None
                 self.inj.dispose(frame, element)
                 reason = "the element is still attached"
+            elif not element and state == "hidden":
+                return None
             elif element:
                 if state == "attached":
                     return element
                 try:
                     if self.inj.element_state(frame, element, state):
+                        if state == "hidden":
+                            self.inj.dispose(frame, element)
+                            return None
                         return element
                     reason = "the element is not %s" % state
                 except (EvaluationError, ContextDestroyed) as failure:

@@ -318,24 +318,58 @@ def test_the_launch_geo_step_measures_nothing_without_a_socks5_proxy(declared):
     assert prepare_session_geo("Asia/Tokyo", {"server": "http://127.0.0.1:9"}, udp_stun_servers=servers).udp_exit is None
 
 
-def test_the_launch_geo_step_does_not_wait_for_the_measurement_after_the_tcp_discovery(declared, monkeypatch):
-    """The two run side by side: a TCP discovery of 0.8 s and a silent UDP of 0.8 s cost 0.8 s, not 1.6."""
+#: A safety net, never a measure: how long the fake TCP discovery waits for the UDP side to start before it gives up (a hang
+#: detector; nothing is compared with a time).
+NET = 60
+
+
+def _geo_step_whose_discovery_waits_for_the_udp_side(declared, monkeypatch, *, serial=False):
+    """Run `prepare_session_geo` against a silent gateway with a fake TCP discovery that returns only once the UDP side has
+    visibly started (the gateway has received the measurement's first datagram). Returns (geo, whether the discovery saw it).
+    `serial` makes the measurement start only when its result is asked for, i.e. after the discovery: the order that is wrong."""
     from invisible_core import prepare_session_geo
 
-    def slow(proxy=None, **kw):
-        time.sleep(0.8)
-        return EXIT
-
-    monkeypatch.setattr(_geo, "discover_egress_ip", slow)
-    monkeypatch.setattr(_udp_exit, "BUDGET", 0.8)
-    monkeypatch.setattr(_udp_exit, "SCHEDULE", (0.0, 0.1, 0.2))
-    servers = declared(EXIT)
+    seen = []
     with UdpGateway(silent=True) as gw:
-        started = time.monotonic()
-        geo = prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=servers)
-        elapsed = time.monotonic() - started
+        def discovery(proxy=None, **kw):
+            end = time.monotonic() + NET
+            while not gw.datagrams and time.monotonic() < end:
+                time.sleep(0.005)
+            seen.append(bool(gw.datagrams))
+            return EXIT
+
+        monkeypatch.setattr(_geo, "discover_egress_ip", discovery)
+        monkeypatch.setattr(_udp_exit, "SCHEDULE", (0.0, 0.1, 0.2))
+        if serial:
+            real_start = _udp_exit.start_measurement
+
+            class _Later:
+                def __init__(self, *args):
+                    self.args = args
+
+                def result(self, tcp_exit_ip):
+                    return real_start(*self.args).result(tcp_exit_ip)
+
+            monkeypatch.setattr(_udp_exit, "start_measurement", lambda *args: _Later(*args))
+        geo = prepare_session_geo("Asia/Tokyo", gw.proxy, udp_stun_servers=declared(EXIT))
+    return geo, seen[0]
+
+
+def test_the_launch_geo_step_does_not_wait_for_the_measurement_after_the_tcp_discovery(declared, monkeypatch):
+    """The two run side by side, proved by order and not by a time: the TCP discovery cannot return before the UDP measurement
+    has sent its first datagram. Run one after the other, the discovery would wait for a start that only its own return allows."""
+    geo, udp_started_while_discovering = _geo_step_whose_discovery_waits_for_the_udp_side(declared, monkeypatch)
+    assert udp_started_while_discovering, "the UDP measurement had not started while the TCP discovery ran: they ran in sequence"
     assert geo.udp_exit == "unmeasured"
-    assert elapsed < 1.3, elapsed
+
+
+def test_the_order_check_sees_a_measurement_that_starts_after_the_discovery(declared, monkeypatch):
+    """The control: with the measurement started after the discovery the discovery never sees the UDP side start, and the
+    check above would say so (here the net is short, since the outcome is certain)."""
+    monkeypatch.setattr(sys.modules[__name__], "NET", 1.0)
+    geo, udp_started_while_discovering = _geo_step_whose_discovery_waits_for_the_udp_side(declared, monkeypatch, serial=True)
+    assert not udp_started_while_discovering
+    assert geo.udp_exit == "unmeasured"
 
 
 def test_a_failed_tcp_discovery_leaves_the_udp_unmeasured_but_a_refusal_is_still_no(declared, monkeypatch):
